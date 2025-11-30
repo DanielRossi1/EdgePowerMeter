@@ -1,151 +1,212 @@
-# EdgePowerMeter ⚡️
+# EdgePowerMeter ⚡
 
-![Prototype photo](assets/prototype/prototype.jpg)
+<div align="center">
 
-A friendly, lightweight power meter to log voltage, current and power of embedded boards while they run inference workloads — ideal for measuring FPS-per-watt (FPS/W) of AI models at the edge.
+![EdgePowerMeter Hardware](assets/prototype/prototype.jpg)
 
----
+**A precision power monitoring system for embedded AI workloads**
 
-## 🔎 Quick Overview
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-ESP32--C3-green.svg)]()
+[![Python](https://img.shields.io/badge/Python-3.8+-yellow.svg)]()
 
-- **What it does:** Measures bus voltage, current and power and logs CSV lines with timestamps.
-- **Primary use case:** Compare efficiency (FPS/W) of ML models on embedded hardware.
-- **Example hardware:** `ESP32C3-SuperMini`, `INA226`, `SSD1306` OLED, `DS3231` RTC.
-
----
-
-## ❗ Safety — Warning
-
-**Warning:** This project shares multiple power and load connections on the same wiring. Incorrect wiring, accidental shorts, or handling while powered can cause electric shock, damage to hardware, fire, or other hazards.
-
-**Recommended precautions**:
-- This circuit is not designed to operate on AC voltages.
-- Disconnect all power before changing wiring or connections.
-- Use fuses or over-current protection on inputs/outputs where practical.
-- Verify polarity and continuity with a multimeter before powering.
-- Avoid making or breaking connections while the device is powered.
-- Do not connect incompatible power sources or allow backfeeding between ports.
-- Keep the device dry and away from conductive contaminants.
-- If you are not experienced with electronics, seek assistance from a qualified technician.
-
-**The author is not responsible for any damage, injury or loss resulting from improper or inexperienced use.**
+</div>
 
 ---
 
-## ✨ Key Features
+## 📋 Table of Contents
 
-- Live power readout on an OLED 128×32 (SSD1306)
-- INA226 power monitor (I2C) with onboard `0.01 Ω` shunt (R2512)
-- DS3231 RTC for accurate timestamps
-- CSV serial output: `Timestamp, Voltage[V], Current[A], Power[W]` at `115200` baud
-
----
-
-## 🧩 Hardware & Project Files
-
-- **Shunt resistor:** `0.01 Ω` (BOM entry `R2512`)
-- **INA226 I2C address:** `0x40`
-- **SSD1306 I2C address:** `0x3C` (128×32)
-- **RTC:** DS3231 (I2C)
-
-Useful files in this repository:
-
-- PCB BOM: `Manufacture/BOM.csv`
-- PCB Gerber: `Manufacture/gerber.zip`
-- PCB Pick-and-place: `Manufacture/PickAndPlace.csv`
-- DIY Wiring schematics: `Schematics/EdgePowerMeter.jpg`
-- DIY Wiring components: `Schematics/EdgePowerMeter_bom.csv`
-- Prototype photo: `assets/prototype/prototype.jpg`
-- Firmware: `EdgePowerMeter.ino`
-- License: `LICENSE` (Apache-2.0)
+- [Overview](#-overview)
+- [Features](#-features)
+- [Desktop Application](#-desktop-application)
+- [Hardware](#-hardware)
+- [Installation](#-installation)
+- [Building](#-building)
+- [Usage](#-usage)
+- [Safety Warning](#-safety-warning)
+- [License](#-license)
 
 ---
 
-## 🔌 Wiring (summary)
+## 🔎 Overview
 
-All I2C modules share SDA and SCL. Use a common 3.3V rail and common GND for MCU, INA226, OLED and RTC. INA226 monitors the voltage drop across the shunt via `VIN+` (shunt high) and `VIN-` (shunt low).
+**EdgePowerMeter** is a complete power monitoring solution designed to measure voltage, current, and power consumption of embedded devices running AI inference workloads. Perfect for benchmarking FPS-per-Watt (FPS/W) efficiency of machine learning models at the edge.
+
+### Why EdgePowerMeter?
+
+- **Precision Measurements**: INA226 power monitor with configurable averaging
+- **Real-time Visualization**: Modern desktop app with live graphs
+- **Data Export**: CSV and PDF report generation
+- **Timestamped Logs**: DS3231 RTC for accurate time synchronization
+- **Open Source**: Full hardware schematics and software included
 
 ---
 
-## 🛠 Firmware
+## ✨ Features
 
-- Main sketch: `EdgePowerMeter.ino`
-- Libraries: `INA226.h`, `Wire.h`, `Adafruit_GFX.h`, `Adafruit_SSD1306.h`, `RTClib.h`
+### Hardware
+- 🔋 **INA226** high-precision power monitor (I²C)
+- 🕐 **DS3231** real-time clock for accurate timestamps
+- 📺 **SSD1306** OLED display (128×32) for live readings
+- ⚡ **ESP32-C3** microcontroller with WiFi/BLE capability
+- 🔧 **0.01Ω shunt** resistor for current sensing
 
-Important configuration in the sketch:
+### Software
+- 📊 Real-time voltage, current, and power graphs
+- 📈 Live statistics with min/max/average values
+- 💾 CSV data export with full measurement history
+- 📄 Professional PDF report generation
+- 🎨 Dark and Light theme support
+- ⚙️ Configurable serial port settings
+- 🔍 Zoom and pan on individual graphs
+- 📐 Selection region for detailed analysis
 
-```cpp
-#define SCREEN_WIDTH 128  // OLED display width, in pixels
-#define SCREEN_HEIGHT 32  // OLED display height, in pixels
+---
 
-#define OLED_RESET -1        // Reset pin # (or -1 if sharing Arduino reset pin)
-#define SCREEN_ADDRESS 0x3C  ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
+## 🖥️ Desktop Application
 
-#define INA226_INTERVAL 10
-#define DISPLAY_INTERVAL 10
+The EdgePowerMeter desktop application provides a modern interface for real-time power monitoring and data analysis.
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-INA226 ina226(0x40);
-RTC_DS3231 rtc;
+### Main Interface
 
-float shunt = 0.010;               /* shunt (Shunt Resistance in Ohms) */
-float current_LSB_mA = 0.100;      /* current_LSB_mA (Current Least Significant Bit in milli Amperes) */
-float current_zero_offset_mA = 0;  /* current_zero_offset_mA (Current Zero Offset in milli Amperes) */
-uint16_t bus_V_scaling_e4 = 10000; /* bus_V_scaling_e4 (Bus Voltage Scaling Factor) */
+![EdgePowerMeter GUI](assets/prototype/app/gui.png)
 
+The main window displays three synchronized graphs showing:
+- **Voltage** (V) - Blue trace
+- **Current** (mA) - Orange trace  
+- **Power** (mW) - Green trace
+
+### Statistics Panel
+
+Real-time statistics are displayed in dedicated cards:
+
+![Statistics Summary](assets/prototype/statistics/summary.png)
+
+Each measurement type shows:
+- Minimum value
+- Maximum value
+- Average value
+- Total energy consumed (Wh)
+
+### Derived Metrics
+
+![Derived Metrics](assets/prototype/statistics/derived.png)
+
+Advanced calculations including:
+- Sampling rate (Hz)
+- Voltage/Current ripple
+- Power factor estimation
+- Load impedance estimation
+
+### Data Export
+
+![Export Options](assets/prototype/app/gui-export.png)
+
+Export your data in multiple formats:
+- **CSV**: Full measurement history with timestamps
+- **PDF**: Professional report with statistics summary
+
+![Export Summary](assets/prototype/app/export-summary.png)
+
+---
+
+## 🧩 Hardware
+
+### Components
+
+| Component | Model | I²C Address | Description |
+|-----------|-------|-------------|-------------|
+| MCU | ESP32-C3 SuperMini | - | Main microcontroller |
+| Power Monitor | INA226 | 0x40 | Voltage/Current sensing |
+| Display | SSD1306 | 0x3C | 128×32 OLED |
+| RTC | DS3231 | 0x68 | Real-time clock |
+| Shunt | R2512 | - | 0.01Ω current sense |
+
+### Project Files
+
+| File | Description |
+|------|-------------|
+| `Manufacture/BOM.csv` | Bill of Materials |
+| `Manufacture/PickAndPlace.csv` | Pick and Place coordinates |
+| `Schematics/EdgePowerMeter.fzz` | Fritzing schematic |
+| `Schematics/EdgePowerMeter_bom.csv` | Schematic BOM |
+| `EdgePowerMeter.ino` | Arduino firmware |
+
+### Wiring Overview
+
+All I²C devices share a common bus:
+- **SDA**: GPIO8 (ESP32-C3)
+- **SCL**: GPIO9 (ESP32-C3)
+- **VCC**: 3.3V common rail
+- **GND**: Common ground
+
+The INA226 monitors voltage across the shunt resistor via `VIN+` (high side) and `VIN-` (low side).
+
+---
+
+## 📦 Installation
+
+### Pre-built Binaries
+
+Download the latest release for your platform from the [Releases](https://github.com/DanielRossi1/EdgePowerMeter/releases) page:
+
+| Platform | File |
+|----------|------|
+| Linux (Debian/Ubuntu) | `edgepowermeter_x.x.x_amd64.deb` |
+| Linux (Other) | `EdgePowerMeter` (standalone) |
+| Windows | `EdgePowerMeter.exe` |
+| macOS | `EdgePowerMeter.app` |
+
+#### Linux (.deb)
+```bash
+sudo dpkg -i edgepowermeter_1.0.0_amd64.deb
+edgepowermeter
 ```
 
----
+#### Linux (standalone)
+```bash
+chmod +x EdgePowerMeter
+./EdgePowerMeter
+```
 
-## 📈 Serial log format
-
-The firmware prints CSV lines on the serial port in this format:
-
-`Timestamp,Voltage[V],Current[A],Power[W]`
-
-Example:
-
-`2025-11-29 12:34:56,5.000,0.250,1.250`
-
-To view logs on Linux (replace `/dev/ttyUSB0` with your serial port):
+### From Source
 
 ```bash
-screen /dev/ttyUSB0 115200
+# Clone the repository
+git clone https://github.com/DanielRossi1/EdgePowerMeter.git
+cd EdgePowerMeter
+
+# Install Python dependencies
+pip install PySide6 pyqtgraph pyserial reportlab numpy
+
+# Run the application
+python run.py
 ```
 
----
+### Firmware
 
-## 🧮 Calculating FPS per Watt (FPS/W)
+#### Arduino IDE
+1. Install ESP32 board support
+2. Install required libraries:
+   - `INA226` by Rob Tillaart
+   - `Adafruit_GFX`
+   - `Adafruit_SSD1306`
+   - `RTClib` by Adafruit
+3. Open `EdgePowerMeter.ino`
+4. Select board: `ESP32C3 Dev Module`
+5. Upload
 
-1. Measure FPS (or inferences per second) on your embedded board.
-2. Compute average power from the CSV `Power[W]` column.
-
-Formula:
-
-`FPS_per_W = FPS / Power_W`
-
-Example: `10 FPS` with `2.5 W` average → `4 FPS/W`.
-
-```cpp
-// Note that samples are already averaged by the INA219 module through
-ina226.setAverage(INA226_16_SAMPLES);
-```
-
-
----
-
-## ⚙️ Build & Upload
-
-Supported toolchains: Arduino IDE, Arduino CLI, PlatformIO.
-
-Arduino CLI example (replace FQBN and port):
+#### Arduino CLI
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32c3:esp32c3s2_mini EdgePowerMeter
-arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32c3:esp32c3s2_mini EdgePowerMeter
+# Compile
+arduino-cli compile --fqbn esp32:esp32:esp32c3 EdgePowerMeter
+
+# Upload
+arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32c3 EdgePowerMeter
 ```
 
-PlatformIO:
+#### PlatformIO
 
 ```bash
 pio run --target upload
@@ -153,27 +214,174 @@ pio run --target upload
 
 ---
 
-## ⚠️ Notes & Tips
+## 🔨 Building
 
-- Make sure the RTC is initialized and set for accurate timestamps.
-- If you see a current offset, adjust `current_LSB_mA` and `current_zero_offset_mA` in the sketch.
+To build standalone executables for distribution:
+
+```bash
+# Install build dependencies
+pip install pyinstaller
+
+# Build executable + .deb package (Linux)
+python build.py all
+
+# Or just the executable
+python build.py exe
+```
+
+Output files are created in `dist/`:
+- `EdgePowerMeter` - Standalone executable
+- `edgepowermeter_1.0.0_amd64.deb` - Debian package
+
+📖 **See [docs/BUILD.md](docs/BUILD.md) for detailed build instructions**, including:
+- Building on Windows and macOS
+- Creating installers
+- CI/CD integration
+- Troubleshooting
 
 ---
 
-## 📁 Support the project
+## 🚀 Usage
 
-TODO list:
-- script to capture the data and calculate statistics
-- 3D printed enclosure
-- More safety!
-- Better PCB design
+### Quick Start
+
+1. **Connect hardware** to your computer via USB
+2. **Launch the app**: `python run.py` or run the executable
+3. **Select serial port** from the dropdown
+4. **Click Start** to begin recording
+
+### Serial Output Format
+
+The firmware outputs CSV data at 115200 baud:
+
+```
+Timestamp,Voltage[V],Current[A],Power[W]
+2025-11-30 12:34:56,5.0123,0.2500,1.2531
+```
+
+### Reading Serial Data (Linux)
+
+```bash
+# Using screen
+screen /dev/ttyUSB0 115200
+
+# Using cat
+cat /dev/ttyUSB0
+```
+
+### Calculating FPS per Watt
+
+```
+FPS/W = Inference_FPS / Average_Power_W
+```
+
+**Example**: 30 FPS inference with 2.5W average = **12 FPS/W**
+
+---
+
+## ⚠️ Safety Warning
+
+> **⚠️ IMPORTANT**: This project involves electrical connections. Incorrect wiring can cause damage, fire, or injury.
+
+### Precautions
+
+- ❌ **NOT designed for AC voltages**
+- 🔌 Disconnect power before changing connections
+- 🔍 Verify polarity with a multimeter before powering
+- ⚡ Use appropriate fuses for your application
+- 💧 Keep device dry and away from conductive materials
+- 👨‍🔧 Seek professional help if unsure
+
+**The author assumes no responsibility for damage or injury resulting from improper use.**
+
+---
+
+## 🛠️ Configuration
+
+### Firmware Settings
+
+Key configuration in `EdgePowerMeter.ino`:
+
+```cpp
+namespace Config {
+    constexpr float SHUNT_RESISTANCE = 0.010f;      // Ohms
+    constexpr float CURRENT_LSB_MA = 0.100f;        // mA resolution
+    constexpr uint16_t INA226_AVERAGING = 16;       // Samples averaged
+    constexpr uint32_t MEASUREMENT_INTERVAL = 10;   // ms between readings
+}
+```
+
+### RTC Synchronization
+
+Set `FORCE_RTC_UPDATE = true` in firmware to sync RTC with compile time on first boot.
+
+---
+
+## 📊 Specifications
+
+| Parameter | Value |
+|-----------|-------|
+| Voltage Range | 0 - 36V |
+| Current Range | ±3.2A (with 0.01Ω shunt) |
+| Resolution | 1.25mV / 0.1mA |
+| Sampling Rate | ~100 Hz |
+| Serial Baud | 115200 |
+| Display Update | 100ms |
+
+---
+
+## 📁 Project Structure
+
+```
+EdgePowerMeter/
+├── EdgePowerMeter.ino      # Arduino firmware
+├── run.py                  # Application entry point
+├── build.py                # Build script for executables
+├── app/
+│   ├── main.py             # Application bootstrap
+│   ├── serial/
+│   │   └── reader.py       # Serial communication
+│   └── ui/
+│       ├── main_window.py  # Main GUI
+│       ├── theme.py        # Dark/Light themes
+│       ├── settings.py     # Settings dialog
+│       └── report.py       # PDF/CSV export
+├── assets/
+│   └── prototype/          # Screenshots and photos
+├── docs/
+│   ├── BUILD.md            # Build instructions
+│   ├── HARDWARE.md         # Hardware documentation
+│   └── SOFTWARE.md         # Software documentation
+├── Manufacture/            # PCB production files
+└── Schematics/             # Circuit diagrams
+```
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit issues and pull requests.
+
+### TODO
+
+- [ ] 3D printed enclosure design
+- [ ] WiFi data streaming
+- [ ] Mobile app companion
+- [ ] Multi-device support
+- [ ] Data logging to SD card
 
 ---
 
 ## 📜 License
 
-This project is licensed under the Apache License 2.0 — see `LICENSE`.
+This project is licensed under the **Apache License 2.0** - see the [LICENSE](LICENSE) file for details.
 
 ---
 
-Enjoy! 😄
+<div align="center">
+
+**Made with ❤️ for the embedded AI community**
+
+⭐ Star this repo if you find it useful!
+
+</div>

@@ -29,11 +29,10 @@ from .report import ReportGenerator, Statistics, MeasurementRecord
 # =============================================================================
 
 class PlotBuffers:
-    """Manages plot data buffers with timestamp aggregation.
+    """Manages plot data buffers with millisecond precision timestamps.
     
-    Aggregates multiple samples with the same timestamp (same second)
-    by averaging them to avoid vertical spikes. Ensures timestamps
-    are always monotonically increasing.
+    Each measurement is stored as a separate point. Out-of-order or
+    duplicate timestamps are discarded to prevent plot artifacts.
     """
     
     def __init__(self, max_points: int = 5000):
@@ -42,45 +41,17 @@ class PlotBuffers:
         self.voltages: Deque[float] = deque(maxlen=max_points)
         self.currents: Deque[float] = deque(maxlen=max_points)
         self.powers: Deque[float] = deque(maxlen=max_points)
-        self._last_ts: float = -1.0
-        self._last_second: int = -1
-        self._acc_v: float = 0.0
-        self._acc_i: float = 0.0
-        self._acc_p: float = 0.0
-        self._acc_count: int = 0
     
     def append(self, t: float, v: float, i: float, p: float) -> None:
-        """Append a sample with timestamp aggregation."""
-        # Ensure monotonically increasing timestamps
-        if t <= self._last_ts:
-            t = self._last_ts + 0.001
+        """Append a sample. Discards if timestamp <= last (out of order)."""
+        # Only accept strictly increasing timestamps
+        if self.timestamps and t <= self.timestamps[-1]:
+            return
         
-        current_second = int(t)
-        
-        if current_second == self._last_second and self._acc_count > 0:
-            # Same second - accumulate for averaging and update last point
-            self._acc_v += v
-            self._acc_i += i
-            self._acc_p += p
-            self._acc_count += 1
-            
-            self.voltages[-1] = self._acc_v / self._acc_count
-            self.currents[-1] = self._acc_i / self._acc_count
-            self.powers[-1] = self._acc_p / self._acc_count
-        else:
-            # New second - add new point immediately
-            self._last_second = current_second
-            self._acc_v = v
-            self._acc_i = i
-            self._acc_p = p
-            self._acc_count = 1
-            
-            self.timestamps.append(t)
-            self.voltages.append(v)
-            self.currents.append(i)
-            self.powers.append(p)
-        
-        self._last_ts = t
+        self.timestamps.append(t)
+        self.voltages.append(v)
+        self.currents.append(i)
+        self.powers.append(p)
     
     def clear(self) -> None:
         """Clear all buffers."""
@@ -88,12 +59,6 @@ class PlotBuffers:
         self.voltages.clear()
         self.currents.clear()
         self.powers.clear()
-        self._last_ts = -1.0
-        self._last_second = -1
-        self._acc_v = 0.0
-        self._acc_i = 0.0
-        self._acc_p = 0.0
-        self._acc_count = 0
     
     @property
     def is_empty(self) -> bool:

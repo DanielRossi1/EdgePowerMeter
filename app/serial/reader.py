@@ -219,6 +219,7 @@ class SerialPortHandler:
             timeout=SerialConfig.DEFAULT_TIMEOUT
         )
         time.sleep(0.1)  # Let port stabilize
+        self._ser.reset_input_buffer()  # Flush any old data
 
     def readline(self) -> str:
         """Read a line from serial port."""

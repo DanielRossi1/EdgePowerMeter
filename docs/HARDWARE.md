@@ -146,6 +146,23 @@ All I²C devices share a common bus:
 | SDA | GPIO8 | 4.7kΩ |
 | SCL | GPIO9 | 4.7kΩ |
 
+### SQW Precision Timing
+
+The DS3231 SQW (Square Wave) output provides a precise 1Hz signal for millisecond-accurate timestamps:
+
+| Signal | ESP32-C3 GPIO | Pin Label | Function |
+|--------|---------------|-----------|----------|
+| SQW | GPIO3 | A3 | 1Hz interrupt for time sync |
+
+**How it works:**
+1. DS3231 outputs a 1Hz square wave on SQW pin
+2. ESP32 captures the falling edge via interrupt
+3. At each pulse, the RTC time is read and cached
+4. Between pulses, `millis()` provides sub-second resolution
+5. Result: Millisecond-accurate timestamps with ±2ppm drift
+
+This hybrid approach combines RTC accuracy with MCU timing precision.
+
 ### I²C Device Addresses
 
 | Device | Address | Function |

@@ -252,12 +252,15 @@ Output files are created in `dist/`:
 
 ### Serial Output Format
 
-The firmware outputs CSV data at 115200 baud:
+The firmware outputs CSV data at 115200 baud with millisecond-precision timestamps:
 
 ```
 Timestamp,Voltage[V],Current[A],Power[W]
-2025-11-30 12:34:56,5.0123,0.2500,1.2531
+2025-11-30 12:34:56.123,5.0123,0.2500,1.2531
+2025-11-30 12:34:56.223,5.0118,0.2498,1.2525
 ```
+
+The timestamp uses the DS3231 RTC with SQW sync for ±2ppm accuracy.
 
 ### Reading Serial Data (Linux)
 

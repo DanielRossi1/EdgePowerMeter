@@ -55,10 +55,12 @@
 - 📊 Real-time voltage, current, and power graphs
 - 📈 Live statistics with min/max/average values
 - 💾 CSV data export with full measurement history
-- 📄 Professional PDF report generation
+- 📂 **CSV import** to reload and re-analyze data
+- 📄 Professional PDF report with **graphs included**
 - 🎨 Dark and Light theme support
-- ⚙️ Configurable serial port settings
-- 🔍 Zoom and pan on individual graphs
+- ⚙️ Configurable serial port settings (921600 baud)
+- 🔍 Zoom and pan on X-axis (Y-axis auto-scales)
+- 🖱️ **Middle-click** to reset auto-scroll
 - 📐 Selection region for detailed analysis
 
 ---
@@ -130,7 +132,7 @@ Export your data in multiple formats:
 | `Manufacture/PickAndPlace.csv` | Pick and Place coordinates |
 | `Schematics/EdgePowerMeter.fzz` | Fritzing schematic |
 | `Schematics/EdgePowerMeter_bom.csv` | Schematic BOM |
-| `EdgePowerMeter.ino` | Arduino firmware |
+| `firmware/firmware.ino` | Arduino firmware with libraries |
 
 ### Wiring Overview
 
@@ -177,7 +179,7 @@ git clone https://github.com/DanielRossi1/EdgePowerMeter.git
 cd EdgePowerMeter
 
 # Install Python dependencies
-pip install PySide6 pyqtgraph pyserial reportlab numpy
+pip install PySide6 pyqtgraph pyserial reportlab matplotlib numpy
 
 # Run the application
 python run.py
@@ -192,7 +194,7 @@ python run.py
    - `Adafruit_GFX`
    - `Adafruit_SSD1306`
    - `RTClib` by Adafruit
-3. Open `EdgePowerMeter.ino`
+3. Open `firmware/firmware.ino`
 4. Select board: `ESP32C3 Dev Module`
 5. Upload
 
@@ -200,10 +202,10 @@ python run.py
 
 ```bash
 # Compile
-arduino-cli compile --fqbn esp32:esp32:esp32c3 EdgePowerMeter
+arduino-cli compile --fqbn esp32:esp32:esp32c3 firmware
 
 # Upload
-arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32c3 EdgePowerMeter
+arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32c3 firmware
 ```
 
 #### PlatformIO
@@ -252,7 +254,7 @@ Output files are created in `dist/`:
 
 ### Serial Output Format
 
-The firmware outputs CSV data at 115200 baud with millisecond-precision timestamps:
+The firmware outputs CSV data at **921600 baud** with millisecond-precision timestamps:
 
 ```
 Timestamp,Voltage[V],Current[A],Power[W]
@@ -266,10 +268,10 @@ The timestamp uses the DS3231 RTC with SQW sync for ±2ppm accuracy.
 
 ```bash
 # Using screen
-screen /dev/ttyUSB0 115200
+screen /dev/ttyUSB0 921600
 
 # Using cat
-cat /dev/ttyUSB0
+stty -F /dev/ttyUSB0 921600 && cat /dev/ttyUSB0
 ```
 
 ### Calculating FPS per Watt
@@ -303,7 +305,7 @@ FPS/W = Inference_FPS / Average_Power_W
 
 ### Firmware Settings
 
-Key configuration in `EdgePowerMeter.ino`:
+Key configuration in `firmware/firmware.ino`:
 
 ```cpp
 namespace Config {
@@ -311,6 +313,7 @@ namespace Config {
     constexpr float CURRENT_LSB_MA = 0.100f;        // mA resolution
     constexpr uint16_t INA226_AVERAGING = 16;       // Samples averaged
     constexpr uint32_t MEASUREMENT_INTERVAL = 10;   // ms between readings
+    constexpr uint32_t SERIAL_BAUD = 921600;        // High-speed serial
 }
 ```
 
@@ -323,12 +326,12 @@ Set `FORCE_RTC_UPDATE = true` in firmware to sync RTC with compile time on first
 ## 📊 Specifications
 
 | Parameter | Value |
-|-----------|-------|
+|-----------|---------|
 | Voltage Range | 0 - 36V |
 | Current Range | ±3.2A (with 0.01Ω shunt) |
 | Resolution | 1.25mV / 0.1mA |
 | Sampling Rate | ~100 Hz |
-| Serial Baud | 115200 |
+| Serial Baud | 921600 |
 | Display Update | 100ms |
 
 ---
@@ -337,18 +340,27 @@ Set `FORCE_RTC_UPDATE = true` in firmware to sync RTC with compile time on first
 
 ```
 EdgePowerMeter/
-├── EdgePowerMeter.ino      # Arduino firmware
+├── firmware/               # Arduino firmware folder
+│   ├── firmware.ino        # Main firmware sketch
+│   ├── PrecisionTime.h/cpp # Millisecond-precision timing library
+│   └── OLEDStatus.h/cpp    # OLED display library
 ├── run.py                  # Application entry point
 ├── build.py                # Build script for executables
 ├── app/
 │   ├── main.py             # Application bootstrap
+│   ├── version.py          # Version info
 │   ├── serial/
 │   │   └── reader.py       # Serial communication
 │   └── ui/
 │       ├── main_window.py  # Main GUI
 │       ├── theme.py        # Dark/Light themes
 │       ├── settings.py     # Settings dialog
-│       └── report.py       # PDF/CSV export
+│       ├── report.py       # PDF/CSV export & import
+│       └── widgets/        # Reusable UI components
+│           ├── plot_widget.py
+│           ├── plot_buffers.py
+│           ├── stat_card.py
+│           └── port_discovery.py
 ├── assets/
 │   └── prototype/          # Screenshots and photos
 ├── docs/
@@ -368,10 +380,9 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 ### TODO
 
 - [ ] 3D printed enclosure design
-- [ ] WiFi data streaming
 - [ ] Mobile app companion
-- [ ] Multi-device support
 - [ ] Data logging to SD card
+- [ ] Improved PCB design
 
 ---
 

@@ -22,16 +22,22 @@ The application follows a modular architecture with clear separation of concerns
 ```
 app/
 ├── main.py              # Application entry point
+├── version.py           # Version information
 ├── serial/
 │   ├── __init__.py
-│   └── reader.py        # Serial communication layer
+│   └── reader.py        # Serial communication layer (921600 baud)
 └── ui/
     ├── __init__.py
     ├── main_window.py   # Main GUI window
     ├── theme.py         # Theme definitions
-    ├── components.py    # Reusable UI components
     ├── settings.py      # Settings management
-    └── report.py        # Export functionality
+    ├── report.py        # Export functionality (CSV/PDF with graphs)
+    └── widgets/         # Reusable UI components
+        ├── __init__.py
+        ├── plot_buffers.py   # Data buffering for plots
+        ├── plot_widget.py    # Three-panel graph widget
+        ├── stat_card.py      # Statistics display card
+        └── port_discovery.py # Serial port detection
 ```
 
 ### Design Principles
@@ -66,7 +72,7 @@ class Measurement:
 @dataclass
 class SerialConfig:
     port: str
-    baud: int = 115200
+    baud: int = 921600  # High-speed serial for fast data transfer
     timeout: float = 0.1
 ```
 
@@ -100,15 +106,18 @@ The main application window containing:
 
 #### Key Classes
 
-**`PlotWidget`**
-- Custom pyqtgraph widget
-- Supports theme switching
+**`PlotWidget`** (`app/ui/widgets/plot_widget.py`)
+- Custom pyqtgraph widget with three synchronized panels
+- Y-axis locked during X-axis zoom (auto-scales to visible data)
+- Middle-click to reset X-axis auto-scroll
+- Theme switching support
 - DateTimeAxis for timestamps
+- Region selector for data export
 
-**`PlotBuffers`**
-- Manages data for plotting
-- Handles timestamp aggregation (averages multiple samples per second)
-- Separate full data storage for export
+**`PlotBuffers`** (`app/ui/widgets/plot_buffers.py`)
+- Manages data for real-time plotting
+- Millisecond-precision timestamps
+- Rejects out-of-order samples to prevent artifacts
 
 **`MainWindow`**
 - Main application window
@@ -212,7 +221,7 @@ Tabbed dialog for configuring:
 
 ### `app/ui/report.py`
 
-Export functionality for measurements.
+Export and import functionality for measurements.
 
 #### `Statistics` (dataclass)
 
@@ -222,15 +231,30 @@ class Statistics:
     voltage_min: float
     voltage_max: float
     voltage_avg: float
+    voltage_std: float
     current_min: float
     current_max: float
     current_avg: float
+    current_std: float
     power_min: float
     power_max: float
     power_avg: float
+    power_std: float
     energy_wh: float
-    duration_s: float
-    sample_count: int
+    charge_ah: float
+    duration_seconds: float
+    count: int
+```
+
+#### `CSVImporter`
+
+**Import from CSV**
+- Auto-detection of separator (comma, semicolon, tab, space)
+- Multiple timestamp format support
+- Load previously exported data for re-analysis
+
+```python
+records = CSVImporter.import_csv(Path("measurement.csv"))
 ```
 
 #### `ReportGenerator`
@@ -241,8 +265,8 @@ class Statistics:
 - Configurable separator
 
 **PDF Export**
-- Professional dark-themed report
-- Statistics summary
+- Professional report with statistics tables
+- **Voltage, Current, and Power graphs** (matplotlib)
 - Derived metrics (sampling rate, ripple, impedance)
 - Automatic pagination
 
@@ -252,11 +276,11 @@ class Statistics:
 
 ### Protocol
 
-The firmware sends CSV data over USB serial:
+The firmware sends CSV data over USB serial at **921600 baud**:
 
 ```
 Timestamp,Voltage[V],Current[A],Power[W]
-2025-11-30 12:34:56,5.0123,0.2500,1.2531
+2025-11-30 12:34:56.123,5.0123,0.2500,1.2531
 ```
 
 ### Parsing
@@ -277,18 +301,17 @@ Two methods are attempted:
 
 ## Data Processing
 
-### Timestamp Aggregation
+### Millisecond-Precision Timestamps
 
-Since the DS3231 RTC has 1-second resolution, multiple samples may share the same timestamp. The `PlotBuffers` class averages these:
+The firmware uses the DS3231 SQW (1Hz square wave) output synchronized with `millis()` to provide millisecond-accurate timestamps:
 
-```python
-# Multiple readings at same second
-12:34:56 → V=5.001, I=250.1, P=1250.3
-12:34:56 → V=4.999, I=249.9, P=1249.7
-
-# Displayed as single averaged point
-12:34:56 → V=5.000, I=250.0, P=1250.0
 ```
+12:34:56.000 → V=5.001, I=250.1, P=1250.3
+12:34:56.100 → V=4.999, I=249.9, P=1249.7
+12:34:56.200 → V=5.002, I=250.2, P=1250.5
+```
+
+The `PlotBuffers` class stores each sample directly and rejects any out-of-order timestamps to prevent graph artifacts.
 
 ### Statistics Calculation
 
@@ -384,15 +407,17 @@ with open("settings.json") as f:
 ## Dependencies
 
 | Package | Version | Purpose |
-|---------|---------|---------|
+|---------|---------|----------|
 | PySide6 | ≥6.0 | Qt GUI framework |
 | pyqtgraph | ≥0.13 | Real-time plotting |
 | pyserial | ≥3.5 | Serial communication |
 | reportlab | ≥4.0 | PDF generation |
+| matplotlib | ≥3.5 | Graphs in PDF reports |
+| numpy | ≥1.20 | Numerical operations |
 
 Install all:
 ```bash
-pip install PySide6 pyqtgraph pyserial reportlab
+pip install PySide6 pyqtgraph pyserial reportlab matplotlib numpy
 ```
 
 ---

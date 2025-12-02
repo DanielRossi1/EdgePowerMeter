@@ -22,8 +22,8 @@ class AppSettings:
     
     # Units
     voltage_unit: str = "V"
-    current_unit: str = "mA"
-    power_unit: str = "mW"
+    current_unit: str = "A"
+    power_unit: str = "W"
     
     # Display
     plot_points: int = 1000
@@ -31,8 +31,12 @@ class AppSettings:
     show_grid: bool = True
     antialiasing: bool = True
     
+    # Average Power
+    use_moving_average: bool = True
+    moving_average_window: int = 100
+    
     # Serial
-    baud_rate: int = 115200
+    baud_rate: int = 921600  # High-speed for ESP32-C3
     auto_reconnect: bool = True
     
     # Export
@@ -182,6 +186,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._create_display_tab(), "📊 Display")
         tabs.addTab(self._create_serial_tab(), "🔌 Serial")
         tabs.addTab(self._create_export_tab(), "📁 Export")
+        tabs.addTab(self._create_about_tab(), "ℹ️ About")
         layout.addWidget(tabs)
         
         # Buttons
@@ -251,13 +256,13 @@ class SettingsDialog(QDialog):
         # Current
         grid.addWidget(QLabel("Current:"), 1, 0)
         self.current_unit_combo = QComboBox()
-        self.current_unit_combo.addItems(["mA", "A", "µA"])
+        self.current_unit_combo.addItems(["A", "mA", "µA"])
         grid.addWidget(self.current_unit_combo, 1, 1)
         
         # Power
         grid.addWidget(QLabel("Power:"), 2, 0)
         self.power_unit_combo = QComboBox()
-        self.power_unit_combo.addItems(["mW", "W", "µW"])
+        self.power_unit_combo.addItems(["W", "mW", "µW"])
         grid.addWidget(self.power_unit_combo, 2, 1)
         
         layout.addWidget(units_group)
@@ -308,8 +313,45 @@ class SettingsDialog(QDialog):
         grid.addWidget(self.antialiasing_check, 3, 0, 1, 2)
         
         layout.addWidget(plot_group)
+        
+        # Average Power group
+        avg_group = QGroupBox("Average Power")
+        avg_layout = QGridLayout(avg_group)
+        avg_layout.setSpacing(12)
+        
+        # Moving average checkbox
+        self.moving_avg_check = QCheckBox("Use moving average")
+        self.moving_avg_check.setToolTip("Use a sliding window average instead of total average")
+        self.moving_avg_check.stateChanged.connect(self._on_moving_avg_changed)
+        avg_layout.addWidget(self.moving_avg_check, 0, 0, 1, 2)
+        
+        # Window size
+        avg_layout.addWidget(QLabel("Window size:"), 1, 0)
+        self.moving_avg_spin = QSpinBox()
+        self.moving_avg_spin.setRange(10, 1000)
+        self.moving_avg_spin.setSingleStep(10)
+        self.moving_avg_spin.setToolTip("Number of samples for moving average")
+        avg_layout.addWidget(self.moving_avg_spin, 1, 1)
+        
+        # Info label
+        self.avg_info_label = QLabel()
+        self.avg_info_label.setStyleSheet("color: #8b949e; font-size: 11px;")
+        self.avg_info_label.setWordWrap(True)
+        avg_layout.addWidget(self.avg_info_label, 2, 0, 1, 2)
+        
+        layout.addWidget(avg_group)
+        
         layout.addStretch()
         return widget
+    
+    def _on_moving_avg_changed(self, state: int) -> None:
+        """Update UI when moving average checkbox changes."""
+        enabled = state == Qt.Checked
+        self.moving_avg_spin.setEnabled(enabled)
+        if enabled:
+            self.avg_info_label.setText(f"Average calculated over last {self.moving_avg_spin.value()} samples.")
+        else:
+            self.avg_info_label.setText("Average calculated over all recorded samples.")
     
     def _create_serial_tab(self) -> QWidget:
         """Create serial settings tab."""
@@ -368,6 +410,89 @@ class SettingsDialog(QDialog):
         layout.addStretch()
         return widget
     
+    def _create_about_tab(self) -> QWidget:
+        """Create about/info tab with software information."""
+        from ..version import __version__, APP_NAME, AUTHOR, DESCRIPTION, URL, LICENSE
+        
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(16)
+        
+        # App info group
+        app_group = QGroupBox("Application")
+        app_layout = QVBoxLayout(app_group)
+        app_layout.setSpacing(8)
+        
+        # App name and version
+        name_label = QLabel(f"⚡ {APP_NAME}")
+        name_label.setStyleSheet("font-size: 18px; font-weight: 700;")
+        app_layout.addWidget(name_label)
+        
+        version_label = QLabel(f"Version {__version__}")
+        version_label.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 14px;")
+        app_layout.addWidget(version_label)
+        
+        desc_label = QLabel(DESCRIPTION)
+        desc_label.setStyleSheet(f"color: {self.theme.text_secondary};")
+        desc_label.setWordWrap(True)
+        app_layout.addWidget(desc_label)
+        
+        layout.addWidget(app_group)
+        
+        # Author group
+        author_group = QGroupBox("Author")
+        author_layout = QVBoxLayout(author_group)
+        author_layout.setSpacing(8)
+        
+        author_label = QLabel(f"👤 {AUTHOR}")
+        author_layout.addWidget(author_label)
+        
+        url_label = QLabel(f"🔗 <a href='{URL}' style='color: {self.theme.accent_primary};'>{URL}</a>")
+        url_label.setOpenExternalLinks(True)
+        author_layout.addWidget(url_label)
+        
+        layout.addWidget(author_group)
+        
+        # License group
+        license_group = QGroupBox("License")
+        license_layout = QVBoxLayout(license_group)
+        
+        license_label = QLabel(f"📄 {LICENSE}")
+        license_layout.addWidget(license_label)
+        
+        license_info = QLabel("This software is open source. See LICENSE file for details.")
+        license_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        license_info.setWordWrap(True)
+        license_layout.addWidget(license_info)
+        
+        layout.addWidget(license_group)
+        
+        # System info
+        import sys
+        import platform
+        
+        sys_group = QGroupBox("System")
+        sys_layout = QGridLayout(sys_group)
+        sys_layout.setSpacing(8)
+        
+        sys_layout.addWidget(QLabel("Python:"), 0, 0)
+        sys_layout.addWidget(QLabel(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"), 0, 1)
+        
+        sys_layout.addWidget(QLabel("Platform:"), 1, 0)
+        sys_layout.addWidget(QLabel(platform.system()), 1, 1)
+        
+        try:
+            from PySide6 import __version__ as pyside_version
+            sys_layout.addWidget(QLabel("PySide6:"), 2, 0)
+            sys_layout.addWidget(QLabel(pyside_version), 2, 1)
+        except ImportError:
+            pass
+        
+        layout.addWidget(sys_group)
+        
+        layout.addStretch()
+        return widget
+    
     def _load_settings(self) -> None:
         """Load current settings into UI."""
         self.dark_mode_check.setChecked(self.settings.dark_mode)
@@ -390,6 +515,12 @@ class SettingsDialog(QDialog):
         self.update_interval_spin.setValue(self.settings.update_interval_ms)
         self.show_grid_check.setChecked(self.settings.show_grid)
         self.antialiasing_check.setChecked(self.settings.antialiasing)
+        
+        # Moving average
+        self.moving_avg_check.setChecked(self.settings.use_moving_average)
+        self.moving_avg_spin.setValue(self.settings.moving_average_window)
+        self.moving_avg_spin.setEnabled(self.settings.use_moving_average)
+        self._on_moving_avg_changed(Qt.Checked if self.settings.use_moving_average else Qt.Unchecked)
         
         # Serial
         idx = self.baud_rate_combo.findText(str(self.settings.baud_rate))
@@ -421,6 +552,10 @@ class SettingsDialog(QDialog):
         self.settings.update_interval_ms = self.update_interval_spin.value()
         self.settings.show_grid = self.show_grid_check.isChecked()
         self.settings.antialiasing = self.antialiasing_check.isChecked()
+        
+        # Moving average
+        self.settings.use_moving_average = self.moving_avg_check.isChecked()
+        self.settings.moving_average_window = self.moving_avg_spin.value()
         
         # Serial
         self.settings.baud_rate = int(self.baud_rate_combo.currentText())

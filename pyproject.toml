@@ -36,6 +36,7 @@ dependencies = [
     "pyserial>=3.5",
     "reportlab>=4.0.0",
     "numpy>=1.20.0",
+    "matplotlib>=3.5.0",
 ]
 
 [project.optional-dependencies]

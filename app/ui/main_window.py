@@ -6,231 +6,18 @@ and export capabilities.
 
 from __future__ import annotations
 
-import re
-from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, List, Optional, Tuple
+from typing import List, Optional
 
 from PySide6 import QtCore, QtWidgets, QtGui
-import pyqtgraph as pg
-from pyqtgraph.graphicsItems.DateAxisItem import DateAxisItem
-from serial.tools import list_ports
 
 from app.serial.reader import SerialReader
 from app.version import __version__, APP_NAME
 from .theme import ThemeColors, DARK_THEME, LIGHT_THEME, generate_stylesheet
 from .settings import SettingsDialog, AppSettings
-from .report import ReportGenerator, Statistics, MeasurementRecord
-
-
-# =============================================================================
-# Plot Buffer
-# =============================================================================
-
-class PlotBuffers:
-    """Manages plot data buffers with millisecond precision timestamps.
-    
-    Each measurement is stored as a separate point. Out-of-order or
-    duplicate timestamps are discarded to prevent plot artifacts.
-    """
-    
-    def __init__(self, max_points: int = 5000):
-        self.max_points = max_points
-        self.timestamps: Deque[float] = deque(maxlen=max_points)
-        self.voltages: Deque[float] = deque(maxlen=max_points)
-        self.currents: Deque[float] = deque(maxlen=max_points)
-        self.powers: Deque[float] = deque(maxlen=max_points)
-    
-    def append(self, t: float, v: float, i: float, p: float) -> None:
-        """Append a sample. Discards if timestamp <= last (out of order)."""
-        # Only accept strictly increasing timestamps
-        if self.timestamps and t <= self.timestamps[-1]:
-            return
-        
-        self.timestamps.append(t)
-        self.voltages.append(v)
-        self.currents.append(i)
-        self.powers.append(p)
-    
-    def clear(self) -> None:
-        """Clear all buffers."""
-        self.timestamps.clear()
-        self.voltages.clear()
-        self.currents.clear()
-        self.powers.clear()
-    
-    @property
-    def is_empty(self) -> bool:
-        return len(self.timestamps) == 0
-
-
-# =============================================================================
-# UI Components
-# =============================================================================
-
-class StatCard(QtWidgets.QFrame):
-    """Compact stat display card."""
-    
-    def __init__(self, label: str, unit: str, color: str, parent=None):
-        super().__init__(parent)
-        self.setProperty("class", "stat-card")
-        self.color = color
-        self._setup_ui(label, unit)
-    
-    def _setup_ui(self, label: str, unit: str) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(2)
-        
-        lbl = QtWidgets.QLabel(label)
-        lbl.setProperty("class", "stat-label")
-        layout.addWidget(lbl)
-        
-        value_layout = QtWidgets.QHBoxLayout()
-        value_layout.setSpacing(4)
-        
-        self.value_label = QtWidgets.QLabel("--")
-        self.value_label.setProperty("class", "stat-value")
-        self.value_label.setStyleSheet(f"color: {self.color};")
-        value_layout.addWidget(self.value_label)
-        
-        unit_label = QtWidgets.QLabel(unit)
-        unit_label.setProperty("class", "stat-label")
-        value_layout.addWidget(unit_label)
-        value_layout.addStretch()
-        
-        layout.addLayout(value_layout)
-    
-    def set_value(self, value: float, decimals: int = 3) -> None:
-        self.value_label.setText(f"{value:.{decimals}f}")
-
-
-class PlotWidget(pg.GraphicsLayoutWidget):
-    """Three-panel plot with independent zoom."""
-    
-    def __init__(self, theme: ThemeColors, parent=None):
-        super().__init__(parent)
-        self.theme = theme
-        self.setBackground(theme.bg_secondary)
-        self._setup_plots()
-        self.region: Optional[pg.LinearRegionItem] = None
-    
-    def _setup_plots(self) -> None:
-        pg.setConfigOptions(antialias=True)
-        
-        self.plot_v = self.addPlot(
-            row=0, col=0, title="Voltage [V]",
-            axisItems={'bottom': DateAxisItem(orientation='bottom')}
-        )
-        self._style_plot(self.plot_v, self.theme.chart_voltage)
-        self.curve_v = self.plot_v.plot(pen=pg.mkPen(self.theme.chart_voltage, width=2))
-        
-        self.nextRow()
-        
-        self.plot_i = self.addPlot(
-            row=1, col=0, title="Current [A]",
-            axisItems={'bottom': DateAxisItem(orientation='bottom')}
-        )
-        self._style_plot(self.plot_i, self.theme.chart_current)
-        self.curve_i = self.plot_i.plot(pen=pg.mkPen(self.theme.chart_current, width=2))
-        
-        self.nextRow()
-        
-        self.plot_p = self.addPlot(
-            row=2, col=0, title="Power [W]",
-            axisItems={'bottom': DateAxisItem(orientation='bottom')}
-        )
-        self._style_plot(self.plot_p, self.theme.chart_power)
-        self.curve_p = self.plot_p.plot(pen=pg.mkPen(self.theme.chart_power, width=2))
-    
-    def _style_plot(self, plot: pg.PlotItem, color: str) -> None:
-        plot.showGrid(x=True, y=True, alpha=0.2)
-        plot.getAxis('left').setTextPen(self.theme.text_primary)
-        plot.getAxis('left').setPen(self.theme.border_default)
-        plot.getAxis('bottom').setTextPen(self.theme.text_primary)
-        plot.getAxis('bottom').setPen(self.theme.border_default)
-        plot.setTitle(plot.titleLabel.text, color=color, size='11pt')
-        plot.getViewBox().setBackgroundColor(self.theme.bg_secondary)
-    
-    def update_data(self, buffers: PlotBuffers) -> None:
-        if buffers.is_empty:
-            return
-        xs = list(buffers.timestamps)
-        self.curve_v.setData(xs, list(buffers.voltages))
-        self.curve_i.setData(xs, list(buffers.currents))
-        self.curve_p.setData(xs, list(buffers.powers))
-    
-    def add_region_selector(self, t_min: float, t_max: float) -> None:
-        self.remove_region_selector()
-        self.region = pg.LinearRegionItem(
-            values=(t_min, t_max),
-            brush=pg.mkBrush(self.theme.accent_primary + "30"),
-            pen=pg.mkPen(self.theme.accent_primary, width=2),
-        )
-        self.region.setZValue(10)
-        self.plot_p.addItem(self.region)
-    
-    def remove_region_selector(self) -> None:
-        if self.region:
-            try:
-                self.plot_p.removeItem(self.region)
-            except Exception:
-                pass
-            self.region = None
-    
-    def get_selected_range(self) -> Optional[Tuple[float, float]]:
-        if not self.region:
-            return None
-        return tuple(sorted(self.region.getRegion()))
-    
-    def update_theme(self, theme: ThemeColors) -> None:
-        """Update all theme-dependent colors."""
-        self.theme = theme
-        self.setBackground(theme.bg_secondary)
-        
-        for plot, color in [
-            (self.plot_v, theme.chart_voltage),
-            (self.plot_i, theme.chart_current),
-            (self.plot_p, theme.chart_power)
-        ]:
-            plot.getAxis('left').setTextPen(theme.text_primary)
-            plot.getAxis('left').setPen(theme.border_default)
-            plot.getAxis('bottom').setTextPen(theme.text_primary)
-            plot.getAxis('bottom').setPen(theme.border_default)
-            plot.setTitle(plot.titleLabel.text, color=color, size='11pt')
-            plot.getViewBox().setBackgroundColor(theme.bg_secondary)
-        
-        self.curve_v.setPen(pg.mkPen(theme.chart_voltage, width=2))
-        self.curve_i.setPen(pg.mkPen(theme.chart_current, width=2))
-        self.curve_p.setPen(pg.mkPen(theme.chart_power, width=2))
-        
-        if self.region:
-            self.region.setBrush(pg.mkBrush(theme.accent_primary + "30"))
-            self.region.setPen(pg.mkPen(theme.accent_primary, width=2))
-
-
-class PortDiscovery:
-    """Serial port discovery utility."""
-    
-    USB_MARKERS = ['USB', 'ACM', 'FTDI', 'CP210', 'CH340', 'PL2303']
-    DEVICE_PATTERN = re.compile(r'ttyUSB|ttyACM|ttyAMA|cu\.usb|COM\d+', re.I)
-    
-    @classmethod
-    def get_ports(cls, show_all: bool = False) -> List[Tuple[str, str]]:
-        result = []
-        for port in list_ports.comports():
-            if show_all or cls._is_usb_device(port):
-                desc = port.description or port.hwid or 'Unknown'
-                result.append((port.device, f"{port.device} — {desc}"))
-        return result
-    
-    @classmethod
-    def _is_usb_device(cls, port) -> bool:
-        if getattr(port, 'vid', None) is not None:
-            return True
-        text = f"{port.description or ''} {port.hwid or ''}".upper()
-        return any(m in text for m in cls.USB_MARKERS) or bool(cls.DEVICE_PATTERN.search(port.device))
+from .report import ReportGenerator, Statistics, MeasurementRecord, CSVImporter
+from .widgets import PlotBuffers, PlotWidget, StatCard, PortDiscovery
 
 
 # =============================================================================
@@ -364,6 +151,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.power_card = StatCard("POWER", "W", self.theme.chart_power)
         layout.addWidget(self.power_card)
         
+        self.avg_power_card = StatCard("AVG POWER", "W", self.theme.accent_primary)
+        layout.addWidget(self.avg_power_card)
+        
         layout.addSpacing(10)
         
         sel_title = QtWidgets.QLabel("📐 Selection")
@@ -397,6 +187,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.setMinimumWidth(90)
         self.stop_btn.setEnabled(False)
         layout.addWidget(self.stop_btn)
+        
+        layout.addSpacing(10)
+        
+        self.import_btn = QtWidgets.QPushButton("📂 Import")
+        self.import_btn.setMinimumWidth(90)
+        self.import_btn.setToolTip("Import data from CSV file")
+        layout.addWidget(self.import_btn)
         
         layout.addStretch()
         
@@ -449,6 +246,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_btn.clicked.connect(self._toggle_connection)
         self.stop_btn.clicked.connect(self._stop_acquisition)
         
+        self.import_btn.clicked.connect(self._import_csv)
         self.select_all_btn.clicked.connect(self._select_all)
         self.export_csv_btn.clicked.connect(self._export_csv)
         self.export_pdf_btn.clicked.connect(self._export_pdf)
@@ -576,7 +374,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_card.set_value(i)
         self.power_card.set_value(p)
         
+        # Calculate average power
+        avg_power = self._calculate_avg_power()
+        self.avg_power_card.set_value(avg_power)
+        
         self.samples_label.setText(f"Samples: {len(self.full_data):,}")
+    
+    def _calculate_avg_power(self) -> float:
+        """Calculate average power based on settings."""
+        if not self.full_data:
+            return 0.0
+        
+        if self.settings.use_moving_average:
+            # Moving average over last N samples
+            window = self.settings.moving_average_window
+            recent = self.full_data[-window:]
+            return sum(r.power for r in recent) / len(recent)
+        else:
+            # Average over all samples
+            return sum(r.power for r in self.full_data) / len(self.full_data)
     
     def _on_error(self, msg: str) -> None:
         QtWidgets.QMessageBox.critical(self, "Serial Error", msg)
@@ -590,7 +406,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.buffers.clear()
         self.full_data = []
         
-        self.plot_widget.remove_region_selector()
+        self.plot_widget.clear_data()
         self.select_all_btn.setEnabled(False)
         self.export_csv_btn.setEnabled(False)
         self.export_pdf_btn.setEnabled(False)
@@ -599,6 +415,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.voltage_card.set_value(0)
         self.current_card.set_value(0)
         self.power_card.set_value(0)
+        self.avg_power_card.set_value(0)
         
         self.sel_samples_label.setText("Samples: --")
         self.sel_duration_label.setText("Duration: --")
@@ -651,6 +468,74 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Duration: {duration:.1f}s" if duration < 60 else f"Duration: {duration/60:.1f}m"
         )
         self.sel_power_label.setText(f"Avg Power: {avg_power:.3f} W")
+    
+    def _import_csv(self) -> None:
+        """Import measurements from a CSV file."""
+        if self._is_connected():
+            QtWidgets.QMessageBox.warning(
+                self, "Warning", 
+                "Stop acquisition before importing data."
+            )
+            return
+        
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import CSV", "", 
+            "CSV Files (*.csv);;Text Files (*.txt);;All Files (*)"
+        )
+        
+        if not path:
+            return
+        
+        try:
+            records = CSVImporter.import_csv(Path(path))
+            
+            # Clear existing data and load imported
+            self._clear_data()
+            self.full_data = records
+            
+            # Populate plot buffers
+            for r in records:
+                self.buffers.append(r.unix_time, r.voltage, r.current, r.power)
+            
+            # Update UI
+            self._update_ui()
+            self._enable_export()
+            
+            if records:
+                self.voltage_card.set_value(records[-1].voltage)
+                self.current_card.set_value(records[-1].current)
+                self.power_card.set_value(records[-1].power)
+            
+            self.samples_label.setText(f"Samples: {len(records):,}")
+            self.status_label.setText(f"● Imported: {Path(path).name}")
+            self.status_label.setStyleSheet(f"color: {self.theme.accent_primary};")
+            
+            # Calculate duration for message
+            if len(records) >= 2:
+                duration = records[-1].unix_time - records[0].unix_time
+                duration_str = f"{duration:.1f}s" if duration < 60 else f"{duration/60:.1f}m"
+            else:
+                duration_str = "N/A"
+            
+            QtWidgets.QMessageBox.information(
+                self, "Import Successful",
+                f"Imported {len(records):,} samples\n"
+                f"Duration: {duration_str}\n"
+                f"From: {Path(path).name}"
+            )
+            
+        except FileNotFoundError as e:
+            QtWidgets.QMessageBox.critical(self, "Error", str(e))
+        except ValueError as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Import Error", 
+                f"Could not parse CSV file:\n{e}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Error", 
+                f"Unexpected error during import:\n{e}"
+            )
     
     def _export_csv(self) -> None:
         records = self._get_selected_records()

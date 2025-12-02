@@ -1,4 +1,4 @@
-"""Three-panel power monitoring plot widget."""
+"""Three-panel power monitoring plot widget with time window control."""
 
 from __future__ import annotations
 from typing import Optional, Tuple
@@ -12,26 +12,34 @@ from .plot_buffers import PlotBuffers
 
 
 class PlotWidget(pg.GraphicsLayoutWidget):
-    """Three-panel plot widget for voltage, current, and power.
+    """Three-panel plot widget with sliding time window.
     
     Features:
-        - Independent zoom for each panel
-        - Time axis with date/time formatting
-        - Theme support (dark/light mode)
-        - Region selector for data selection
-        - Middle-click to reset auto-scroll on X-axis
+        - Configurable time window (default 10 seconds)
+        - Mouse wheel to zoom time window
+        - Drag to pan through history
+        - Auto-scroll when at live edge
+        - Middle-click to reset to live view
+        - All three plots synchronized
     """
     
+    # Time window settings
+    DEFAULT_WINDOW_SECONDS = 10.0
+    MIN_WINDOW_SECONDS = 1.0
+    MAX_WINDOW_SECONDS = 300.0  # 5 minutes max
+    ZOOM_FACTOR = 1.2
+    
     def __init__(self, theme: ThemeColors, parent=None):
-        """Initialize plot widget.
-        
-        Args:
-            theme: Theme colors to use
-            parent: Parent widget
-        """
         super().__init__(parent)
         self.theme = theme
         self.setBackground(theme.bg_secondary)
+        
+        # Time window state
+        self._window_seconds = self.DEFAULT_WINDOW_SECONDS
+        self._auto_scroll = True  # Follow live data
+        self._last_data_time: float = 0.0
+        self._is_panning = False
+        
         self._setup_plots()
         self.region: Optional[pg.LinearRegionItem] = None
     
@@ -72,6 +80,19 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self.curve_p = self.plot_p.plot(
             pen=pg.mkPen(self.theme.chart_power, width=2)
         )
+        
+        # Link X-axes so all plots pan together
+        self.plot_i.setXLink(self.plot_v)
+        self.plot_p.setXLink(self.plot_v)
+        
+        # Configure X-axis: we control range manually
+        for plot in [self.plot_v, self.plot_i, self.plot_p]:
+            plot.enableAutoRange(axis='x', enable=False)
+            plot.setMouseEnabled(x=True, y=False)
+            plot.enableAutoRange(axis='y', enable=True)
+        
+        # Connect to pan events (detect when user drags)
+        self.plot_v.sigXRangeChanged.connect(self._on_x_range_changed)
     
     def _style_plot(self, plot: pg.PlotItem, color: str) -> None:
         """Apply theme styling to a plot panel."""
@@ -82,32 +103,107 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         plot.getAxis('bottom').setPen(self.theme.border_default)
         plot.setTitle(plot.titleLabel.text, color=color, size='11pt')
         plot.getViewBox().setBackgroundColor(self.theme.bg_secondary)
+    
+    def _on_x_range_changed(self, view, range_) -> None:
+        """Called when user pans the view."""
+        if self._is_panning or not self._last_data_time:
+            return
         
-        # Lock Y-axis: only allow zoom/pan on X-axis
-        # Y range will auto-scale to visible data
-        plot.getViewBox().setMouseEnabled(x=True, y=False)
-        plot.enableAutoRange(axis='y', enable=True)
+        # Check if we're near the live edge (within 0.5 seconds)
+        view_end = range_[1]
+        at_live_edge = (view_end >= self._last_data_time - 0.5)
+        
+        # If user dragged away from live edge, disable auto-scroll
+        if not at_live_edge:
+            self._auto_scroll = False
     
     def update_data(self, buffers: PlotBuffers) -> None:
-        """Update plots with new data.
-        
-        Args:
-            buffers: PlotBuffers containing the data to display
-        """
+        """Update plots with buffered data."""
         if buffers.is_empty:
             return
-        xs = list(buffers.timestamps)
-        self.curve_v.setData(xs, list(buffers.voltages))
-        self.curve_i.setData(xs, list(buffers.currents))
-        self.curve_p.setData(xs, list(buffers.powers))
+        
+        # Get all data as numpy arrays
+        xs, vs, cs, ps = buffers.get_arrays()
+        
+        if len(xs) == 0:
+            return
+        
+        # Update curves with all data
+        self.curve_v.setData(xs, vs)
+        self.curve_i.setData(xs, cs)
+        self.curve_p.setData(xs, ps)
+        
+        # Track latest data time
+        self._last_data_time = xs[-1]
+        
+        # Update view window if auto-scrolling
+        if self._auto_scroll:
+            self._update_view_range()
+    
+    def _update_view_range(self) -> None:
+        """Update the visible time range to follow live data."""
+        if self._last_data_time <= 0:
+            return
+        
+        # Follow live data: show last N seconds
+        t_end = self._last_data_time
+        t_start = t_end - self._window_seconds
+        
+        # Prevent signal recursion
+        self._is_panning = True
+        self.plot_v.setXRange(t_start, t_end, padding=0)
+        self._is_panning = False
+    
+    def wheelEvent(self, event) -> None:
+        """Handle mouse wheel for time window zoom."""
+        delta = event.angleDelta().y()
+        
+        if delta > 0:
+            # Zoom in (smaller window)
+            self._window_seconds = max(
+                self.MIN_WINDOW_SECONDS,
+                self._window_seconds / self.ZOOM_FACTOR
+            )
+        else:
+            # Zoom out (larger window)
+            self._window_seconds = min(
+                self.MAX_WINDOW_SECONDS,
+                self._window_seconds * self.ZOOM_FACTOR
+            )
+        
+        # Apply new window
+        if self._auto_scroll:
+            self._update_view_range()
+        else:
+            # Zoom around center of current view
+            current_range = self.plot_v.viewRange()[0]
+            center = (current_range[0] + current_range[1]) / 2
+            t_start = center - self._window_seconds / 2
+            t_end = center + self._window_seconds / 2
+            
+            self._is_panning = True
+            self.plot_v.setXRange(t_start, t_end, padding=0)
+            self._is_panning = False
+        
+        event.accept()
+    
+    def mousePressEvent(self, event) -> None:
+        """Handle mouse press events."""
+        if event.button() == Qt.MiddleButton:
+            # Reset to live view
+            self._auto_scroll = True
+            self._window_seconds = self.DEFAULT_WINDOW_SECONDS
+            self._update_view_range()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+    
+    # -------------------------------------------------------------------------
+    # Region selector for data export
+    # -------------------------------------------------------------------------
     
     def add_region_selector(self, t_min: float, t_max: float) -> None:
-        """Add or update a region selector on the power plot.
-        
-        Args:
-            t_min: Start time (Unix timestamp)
-            t_max: End time (Unix timestamp)
-        """
+        """Add or update a region selector on the power plot."""
         self.remove_region_selector()
         self.region = pg.LinearRegionItem(
             values=(t_min, t_max),
@@ -127,21 +223,17 @@ class PlotWidget(pg.GraphicsLayoutWidget):
             self.region = None
     
     def get_selected_range(self) -> Optional[Tuple[float, float]]:
-        """Get the currently selected time range.
-        
-        Returns:
-            Tuple of (start_time, end_time) or None if no selection
-        """
+        """Get the currently selected time range."""
         if not self.region:
             return None
         return tuple(sorted(self.region.getRegion()))
     
+    # -------------------------------------------------------------------------
+    # Theme and cleanup
+    # -------------------------------------------------------------------------
+    
     def update_theme(self, theme: ThemeColors) -> None:
-        """Update all theme-dependent colors.
-        
-        Args:
-            theme: New theme colors to apply
-        """
+        """Update all theme-dependent colors."""
         self.theme = theme
         self.setBackground(theme.bg_secondary)
         
@@ -166,27 +258,33 @@ class PlotWidget(pg.GraphicsLayoutWidget):
             self.region.setPen(pg.mkPen(theme.accent_primary, width=2))
     
     def clear_data(self) -> None:
-        """Clear all plot data."""
+        """Clear all plot data and reset view."""
         self.curve_v.setData([], [])
         self.curve_i.setData([], [])
         self.curve_p.setData([], [])
         self.remove_region_selector()
-        # Reset auto-range after clearing
-        self.reset_x_autorange()
-    
-    def mousePressEvent(self, event) -> None:
-        """Handle mouse press events.
         
-        Middle-click resets X-axis auto-range for all plots.
-        """
-        if event.button() == Qt.MiddleButton:
-            self.reset_x_autorange()
-        super().mousePressEvent(event)
+        # Reset state
+        self._auto_scroll = True
+        self._window_seconds = self.DEFAULT_WINDOW_SECONDS
+        self._last_data_time = 0.0
     
-    def reset_x_autorange(self) -> None:
-        """Reset X-axis to auto-range mode for all plots.
-        
-        Call this to resume automatic scrolling after manual zoom/pan.
-        """
-        for plot in [self.plot_v, self.plot_i, self.plot_p]:
-            plot.enableAutoRange(axis='x', enable=True)
+    def reset_to_live(self) -> None:
+        """Reset to live auto-scrolling view (same as middle-click)."""
+        self._auto_scroll = True
+        self._update_view_range()
+    
+    @property
+    def window_seconds(self) -> float:
+        """Current time window size in seconds."""
+        return self._window_seconds
+    
+    @window_seconds.setter
+    def window_seconds(self, value: float) -> None:
+        """Set time window size."""
+        self._window_seconds = max(
+            self.MIN_WINDOW_SECONDS,
+            min(self.MAX_WINDOW_SECONDS, value)
+        )
+        if self._auto_scroll:
+            self._update_view_range()

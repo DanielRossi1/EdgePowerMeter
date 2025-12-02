@@ -483,6 +483,12 @@ class ReportGenerator:
         from reportlab.platypus import Image
         from reportlab.lib.units import mm
         
+        # Downsample if too many points (for performance)
+        MAX_GRAPH_POINTS = 2000
+        if len(records) > MAX_GRAPH_POINTS:
+            step = len(records) // MAX_GRAPH_POINTS
+            records = records[::step]
+        
         # Extract data
         timestamps = [r.timestamp for r in records]
         voltages = [r.voltage for r in records]

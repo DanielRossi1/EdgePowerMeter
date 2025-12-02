@@ -6,9 +6,10 @@ and export capabilities.
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Deque
 
 from PySide6 import QtCore, QtWidgets, QtGui
 
@@ -27,8 +28,9 @@ from .widgets import PlotBuffers, PlotWidget, StatCard, PortDiscovery
 class MainWindow(QtWidgets.QMainWindow):
     """Main application window."""
     
-    PLOT_UPDATE_MS = 50
+    PLOT_UPDATE_MS = 100  # Update plots every 100ms (10 FPS) for smooth performance
     STOP_TIMEOUT_MS = 3000
+    MAX_DATA_POINTS = 100000  # Max points before warning
     
     def __init__(self):
         super().__init__()
@@ -45,6 +47,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.report_generator = ReportGenerator()
         self.settings = AppSettings()
         self.theme = DARK_THEME
+        
+        # Running statistics for efficient avg power calculation
+        self._power_sum: float = 0.0
+        self._power_window: Deque[float] = deque(maxlen=1000)  # For moving average
     
     def _setup_ui(self) -> None:
         self.setWindowTitle(f"{APP_NAME} v{__version__}")
@@ -296,6 +302,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_settings_changed(self, settings: AppSettings) -> None:
         self.settings = settings
         self.buffers.max_points = settings.plot_points
+        
+        # Update power window size for moving average
+        new_window = deque(self._power_window, maxlen=settings.moving_average_window)
+        self._power_window = new_window
     
     # -------------------------------------------------------------------------
     # Connection
@@ -370,29 +380,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.buffers.append(t, v, i, p)
         self.full_data.append(MeasurementRecord(ts, t, v, i, p))
         
+        # Update running statistics
+        self._power_sum += p
+        self._power_window.append(p)
+        
+        # Update UI cards (lightweight)
         self.voltage_card.set_value(v)
         self.current_card.set_value(i)
         self.power_card.set_value(p)
         
-        # Calculate average power
+        # Calculate average power efficiently
         avg_power = self._calculate_avg_power()
         self.avg_power_card.set_value(avg_power)
         
-        self.samples_label.setText(f"Samples: {len(self.full_data):,}")
+        # Update sample count less frequently (every 10 samples)
+        n = len(self.full_data)
+        if n % 10 == 0:
+            self.samples_label.setText(f"Samples: {n:,}")
     
     def _calculate_avg_power(self) -> float:
-        """Calculate average power based on settings."""
+        """Calculate average power efficiently using running statistics."""
         if not self.full_data:
             return 0.0
         
         if self.settings.use_moving_average:
-            # Moving average over last N samples
-            window = self.settings.moving_average_window
-            recent = self.full_data[-window:]
-            return sum(r.power for r in recent) / len(recent)
+            # Moving average using deque - O(1)
+            if self._power_window:
+                return sum(self._power_window) / len(self._power_window)
+            return 0.0
         else:
-            # Average over all samples
-            return sum(r.power for r in self.full_data) / len(self.full_data)
+            # Total average using running sum - O(1)
+            return self._power_sum / len(self.full_data)
     
     def _on_error(self, msg: str) -> None:
         QtWidgets.QMessageBox.critical(self, "Serial Error", msg)
@@ -405,6 +423,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _clear_data(self) -> None:
         self.buffers.clear()
         self.full_data = []
+        
+        # Reset running statistics
+        self._power_sum = 0.0
+        self._power_window.clear()
         
         self.plot_widget.clear_data()
         self.select_all_btn.setEnabled(False)
@@ -460,13 +482,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sel_power_label.setText("Avg Power: --")
             return
         
-        duration = records[-1].unix_time - records[0].unix_time
+        # Use absolute difference to handle any ordering issues
+        duration = abs(records[-1].unix_time - records[0].unix_time)
         avg_power = sum(r.power for r in records) / len(records)
         
         self.sel_samples_label.setText(f"Samples: {len(records):,}")
-        self.sel_duration_label.setText(
-            f"Duration: {duration:.1f}s" if duration < 60 else f"Duration: {duration/60:.1f}m"
-        )
+        if duration < 60:
+            self.sel_duration_label.setText(f"Duration: {duration:.1f}s")
+        elif duration < 3600:
+            self.sel_duration_label.setText(f"Duration: {duration/60:.1f}m")
+        else:
+            self.sel_duration_label.setText(f"Duration: {duration/3600:.1f}h")
         self.sel_power_label.setText(f"Avg Power: {avg_power:.3f} W")
     
     def _import_csv(self) -> None:
@@ -551,15 +577,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         
-        try:
-            self.report_generator.export_csv(
-                Path(path), records, self.settings.csv_separator
-            )
-            QtWidgets.QMessageBox.information(
-                self, "Success", f"Exported {len(records):,} samples to:\n{path}"
-            )
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Export failed: {e}")
+        # Run export with progress dialog
+        self._run_export(
+            lambda: self.report_generator.export_csv(Path(path), records, self.settings.csv_separator),
+            f"Exported {len(records):,} samples to:\n{path}",
+            "Exporting CSV..."
+        )
     
     def _export_pdf(self) -> None:
         records = self._get_selected_records()
@@ -580,20 +603,41 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         
+        summary = (
+            f"Report generated!\n\n"
+            f"Samples: {stats.count:,}\n"
+            f"Duration: {stats.duration_seconds:.1f}s\n"
+            f"Avg Power: {stats.power_avg:.4f} W\n"
+            f"Energy: {stats.energy_wh*1000:.4f} mWh\n\n"
+            f"Saved to:\n{path}"
+        )
+        
+        # Run export with progress dialog
+        self._run_export(
+            lambda: self.report_generator.export_pdf(Path(path), stats, records),
+            summary,
+            "Generating PDF report..."
+        )
+    
+    def _run_export(self, export_func, success_msg: str, progress_msg: str) -> None:
+        """Run export function with progress dialog."""
+        progress = QtWidgets.QProgressDialog(progress_msg, None, 0, 0, self)
+        progress.setWindowTitle("Exporting")
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.show()
+        
+        # Process events to show dialog
+        QtCore.QCoreApplication.processEvents()
+        
         try:
-            self.report_generator.export_pdf(Path(path), stats, records)
-            
-            summary = (
-                f"Report generated!\n\n"
-                f"Samples: {stats.count:,}\n"
-                f"Duration: {stats.duration_seconds:.1f}s\n"
-                f"Avg Power: {stats.power_avg:.4f} W\n"
-                f"Energy: {stats.energy_wh*1000:.4f} mWh\n\n"
-                f"Saved to:\n{path}"
-            )
-            QtWidgets.QMessageBox.information(self, "Success", summary)
+            export_func()
+            progress.close()
+            QtWidgets.QMessageBox.information(self, "Success", success_msg)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"PDF generation failed: {e}")
+            progress.close()
+            QtWidgets.QMessageBox.critical(self, "Error", f"Export failed: {e}")
     
     # -------------------------------------------------------------------------
     # Cleanup

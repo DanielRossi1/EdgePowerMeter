@@ -7,10 +7,9 @@ from the EdgePowerMeter firmware and emits it as Qt signals.
 from __future__ import annotations
 
 import io
-import fcntl
 import logging
 import os
-import termios
+import sys
 import time
 import traceback
 from dataclasses import dataclass
@@ -19,6 +18,12 @@ from typing import Optional
 
 from PySide6 import QtCore
 import serial
+
+# Platform-specific imports for direct serial access (Linux only)
+_IS_LINUX = sys.platform.startswith('linux')
+if _IS_LINUX:
+    import fcntl
+    import termios
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +157,21 @@ class SerialPortHandler:
         return self._ser is not None and self._ser.is_open
 
     def open(self) -> None:
-        """Open serial port, trying direct method first, then pyserial."""
+        """Open serial port, trying direct method first (Linux), then pyserial."""
+        # On Windows, only use pyserial
+        if not _IS_LINUX:
+            try:
+                self._open_pyserial()
+                self._use_direct = False
+                logger.info(f"Opened {self.port} using pyserial")
+            except Exception as e:
+                raise ConnectionError(
+                    f"Cannot open {self.port}: {e}\n"
+                    "Check that the device exists and permissions are correct."
+                ) from e
+            return
+        
+        # On Linux, try direct method first, then pyserial
         try:
             self._open_direct()
             self._use_direct = True

@@ -214,6 +214,10 @@ jobs:
 
       - name: Create DMG
         run: |
+          # Clean up to free disk space
+          rm -rf ~/Library/Caches/* 2>/dev/null || true
+          rm -rf ~/.cache/* 2>/dev/null || true
+          # Create DMG
           hdiutil create -volname "EdgePowerMeter" -srcfolder dist/EdgePowerMeter.app -ov -format UDZO dist/EdgePowerMeter-apple-silicon.dmg
 
       - name: Upload macOS ARM artifacts

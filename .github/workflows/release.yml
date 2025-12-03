@@ -166,6 +166,17 @@ jobs:
   build-macos-arm:
     runs-on: macos-14  # Apple Silicon (M1/M2)
     steps:
+      - name: Free disk space
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h
+          # Remove unnecessary large directories
+          sudo rm -rf /Users/runner/Library/Android 2>/dev/null || true
+          sudo rm -rf /Users/runner/.dotnet 2>/dev/null || true
+          sudo rm -rf /opt/hostedtoolcache 2>/dev/null || true
+          echo "=== Disk space after cleanup ==="
+          df -h
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -214,10 +225,6 @@ jobs:
 
       - name: Create DMG
         run: |
-          # Clean up to free disk space
-          rm -rf ~/Library/Caches/* 2>/dev/null || true
-          rm -rf ~/.cache/* 2>/dev/null || true
-          # Create DMG
           hdiutil create -volname "EdgePowerMeter" -srcfolder dist/EdgePowerMeter.app -ov -format UDZO dist/EdgePowerMeter-apple-silicon.dmg
 
       - name: Upload macOS ARM artifacts

@@ -1,7 +1,7 @@
 /**
  * @file EdgePowerMeter.ino
  * @brief Real-time power monitoring firmware for embedded AI workload analysis
- * @version 1.2.0
+ * @version 1.3.0
  * 
  * This firmware reads voltage, current, and power measurements from an INA226
  * power monitor and outputs CSV-formatted data via serial for logging and analysis.
@@ -49,7 +49,7 @@
 // Version
 // =============================================================================
 
-#define FIRMWARE_VERSION "1.2.0"
+#define FIRMWARE_VERSION "1.3.0"
 #define FIRMWARE_NAME "EdgePowerMeter"
 
 // =============================================================================
@@ -74,8 +74,11 @@ namespace Config {
     constexpr uint16_t BUS_VOLTAGE_SCALING = 10000;
     
     // Timing intervals (milliseconds)
-    constexpr unsigned long MEASUREMENT_INTERVAL_MS = 10;
-    constexpr unsigned long DISPLAY_INTERVAL_MS = 100;
+    // MEASUREMENT_INTERVAL_MS: how often to read the INA226 sensor
+    // OUTPUT_INTERVAL_MS: how often to send data via serial (set to same as measurement for max speed)
+    constexpr unsigned long MEASUREMENT_INTERVAL_MS = 10;   // 100 Hz measurement
+    constexpr unsigned long OUTPUT_INTERVAL_MS = 10;        // 100 Hz output (was 100ms = 10Hz)
+    constexpr unsigned long DISPLAY_INTERVAL_MS = 100;      // 10 Hz display update (OLED is slow)
     
     // Serial settings
     // 921600 baud for faster data transfer (ESP32-C3 USB-CDC supports high speeds)
@@ -111,6 +114,7 @@ PrecisionTime precisionTime(rtc, Config::SQW_PIN);
 
 Measurement currentMeasurement;
 unsigned long lastMeasurementTime = 0;
+unsigned long lastOutputTime = 0;
 unsigned long lastDisplayTime = 0;
 
 // =============================================================================
@@ -265,16 +269,21 @@ void loop() {
     
     unsigned long now = millis();
     
-    // Read measurement at configured interval
+    // Read measurement and output at configured interval
     if (now - lastMeasurementTime >= Config::MEASUREMENT_INTERVAL_MS) {
         currentMeasurement = PowerMonitor::read();
         lastMeasurementTime = now;
+        
+        // Output data at measurement rate (or slower if OUTPUT_INTERVAL_MS > MEASUREMENT_INTERVAL_MS)
+        if (now - lastOutputTime >= Config::OUTPUT_INTERVAL_MS) {
+            SerialOutput::printCSV(currentMeasurement);
+            lastOutputTime = now;
+        }
     }
     
-    // Update display and output at configured interval
+    // Update display at slower rate (OLED is slow)
     if (now - lastDisplayTime >= Config::DISPLAY_INTERVAL_MS) {
         display.showPower(currentMeasurement.power);
-        SerialOutput::printCSV(currentMeasurement);
         lastDisplayTime = now;
     }
 }

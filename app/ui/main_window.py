@@ -6,6 +6,7 @@ and export capabilities.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.report_generator = ReportGenerator()
         self.settings = AppSettings()
         self.theme = DARK_THEME
+        
+        # Flag to track if we're actively acquiring
+        self._acquiring = False
+        self._acq_start_time: float = 0.0  # perf_counter at acquisition start
         
         # Running statistics for efficient avg power calculation
         self._power_sum: float = 0.0
@@ -128,10 +133,17 @@ class MainWindow(QtWidgets.QMainWindow):
         
         layout.addStretch()
         
+        # Start and Stop buttons together
         self.connect_btn = QtWidgets.QPushButton("▶ Start")
         self.connect_btn.setProperty("class", "success")
-        self.connect_btn.setMinimumWidth(110)
+        self.connect_btn.setMinimumWidth(100)
         layout.addWidget(self.connect_btn)
+        
+        self.stop_btn = QtWidgets.QPushButton("⏹ Stop")
+        self.stop_btn.setProperty("class", "danger")
+        self.stop_btn.setMinimumWidth(100)
+        self.stop_btn.setEnabled(False)
+        layout.addWidget(self.stop_btn)
         
         parent.addWidget(frame)
     
@@ -189,13 +201,6 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
         
-        self.stop_btn = QtWidgets.QPushButton("⏹ Stop")
-        self.stop_btn.setMinimumWidth(90)
-        self.stop_btn.setEnabled(False)
-        layout.addWidget(self.stop_btn)
-        
-        layout.addSpacing(10)
-        
         self.import_btn = QtWidgets.QPushButton("📂 Import")
         self.import_btn.setMinimumWidth(90)
         self.import_btn.setToolTip("Import data from CSV file")
@@ -249,7 +254,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _connect_signals(self) -> None:
         self.refresh_btn.clicked.connect(self._refresh_ports)
         self.show_all_cb.stateChanged.connect(self._refresh_ports)
-        self.connect_btn.clicked.connect(self._toggle_connection)
+        self.connect_btn.clicked.connect(self._start_acquisition)
         self.stop_btn.clicked.connect(self._stop_acquisition)
         
         self.import_btn.clicked.connect(self._import_csv)
@@ -331,31 +336,55 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Error", "Select a serial port first.")
             return
         
-        self.reader = SerialReader(port, baud=self.settings.baud_rate)
-        self.reader.data_received.connect(self._on_data)
-        self.reader.error.connect(self._on_error)
-        self.reader.start()
+        # Make sure any previous reader is fully stopped
+        if self.reader is not None:
+            try:
+                self.reader.data_received.disconnect(self._on_data)
+                self.reader.error.disconnect(self._on_error)
+            except RuntimeError:
+                pass
+            self.reader.stop(self.STOP_TIMEOUT_MS)
+            self.reader = None
         
+        # Clear data BEFORE starting reader to avoid race condition
         self._clear_data()
         
-        self.connect_btn.setText("⏹ Stop")
-        self.connect_btn.setProperty("class", "danger")
-        self.connect_btn.setStyle(self.connect_btn.style())
+        # Longer delay to ensure port is released and buffers are clean
+        QtCore.QCoreApplication.processEvents()
+        QtCore.QThread.msleep(200)
         
+        # Create and start new reader
+        self.reader = SerialReader(port, baud=self.settings.baud_rate)
+        self.reader.data_received.connect(self._on_data, QtCore.Qt.QueuedConnection)
+        self.reader.error.connect(self._on_error, QtCore.Qt.QueuedConnection)
+        self.reader.start()
+        
+        # Now we're acquiring - record start time
+        self._acquiring = True
+        self._acq_start_time = time.perf_counter()
+        
+        self.connect_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         
         self.status_label.setText(f"● Connected: {port}")
         self.status_label.setStyleSheet(f"color: {self.theme.accent_success};")
     
     def _stop_acquisition(self) -> None:
+        # Stop acquiring first
+        self._acquiring = False
+        
         if self.reader:
+            # Disconnect signals first to avoid race conditions
+            try:
+                self.reader.data_received.disconnect(self._on_data)
+                self.reader.error.disconnect(self._on_error)
+            except RuntimeError:
+                pass  # Already disconnected
+            
             self.reader.stop(self.STOP_TIMEOUT_MS)
             self.reader = None
         
-        self.connect_btn.setText("▶ Start")
-        self.connect_btn.setProperty("class", "success")
-        self.connect_btn.setStyle(self.connect_btn.style())
-        
+        self.connect_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         
         self.status_label.setText("● Disconnected")
@@ -369,16 +398,22 @@ class MainWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     
     def _on_data(self, data: dict) -> None:
+        # Ignore data if we're not actively acquiring
+        if not self._acquiring:
+            return
+        
+        # Use local perf_counter for relative time (reliable, no RTC issues)
+        rel_time = time.perf_counter() - self._acq_start_time
+        
+        # Keep firmware timestamp for export
         ts = data['timestamp']
-        try:
-            t = ts.timestamp()
-        except Exception:
-            t = datetime.now().timestamp()
         
         v, i, p = data['voltage'], data['current'], data['power']
         
-        self.buffers.append(t, v, i, p)
-        self.full_data.append(MeasurementRecord(ts, t, v, i, p))
+        # Use relative time for plotting
+        self.buffers.append(rel_time, v, i, p)
+        
+        self.full_data.append(MeasurementRecord(ts, rel_time, rel_time, v, i, p))
         
         # Update running statistics
         self._power_sum += p
@@ -451,8 +486,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.full_data:
             return
         
-        t_min = self.full_data[0].unix_time
-        t_max = self.full_data[-1].unix_time
+        # Use relative time for region selector (starts from 0)
+        t_min = self.full_data[0].relative_time
+        t_max = self.full_data[-1].relative_time
         self.plot_widget.add_region_selector(t_min, t_max)
         
         self.select_all_btn.setEnabled(True)
@@ -462,8 +498,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _select_all(self) -> None:
         if not self.full_data:
             return
-        t_min = self.full_data[0].unix_time
-        t_max = self.full_data[-1].unix_time
+        t_min = self.full_data[0].relative_time
+        t_max = self.full_data[-1].relative_time
         self.plot_widget.add_region_selector(t_min, t_max)
     
     def _get_selected_records(self) -> List[MeasurementRecord]:
@@ -471,7 +507,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not time_range:
             return self.full_data
         t0, t1 = time_range
-        return [r for r in self.full_data if t0 <= r.unix_time <= t1]
+        # Filter by relative time (matches the plot axis)
+        return [r for r in self.full_data if t0 <= r.relative_time <= t1]
     
     def _update_selection_stats(self) -> None:
         records = self._get_selected_records()

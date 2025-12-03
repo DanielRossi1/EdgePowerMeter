@@ -1,0 +1,271 @@
+name: Build and Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-cursor0 libxcb-xinerama0 libxkbcommon-x11-0
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+
+      - name: Build executable
+        run: python build.py exe
+
+      - name: Build .deb package
+        run: python build.py deb
+
+      - name: Upload Linux amd64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64-builds
+          path: |
+            dist/EdgePowerMeter
+            dist/*.deb
+
+  build-linux-arm64:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-cursor0 libxcb-xinerama0 libxkbcommon-x11-0
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+
+      - name: Build executable
+        run: python build.py exe
+
+      - name: Build .deb package for ARM64
+        run: python build.py deb
+
+      - name: Rename executable for clarity
+        run: mv dist/EdgePowerMeter dist/EdgePowerMeter-arm64
+
+      - name: Upload Linux ARM64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-builds
+          path: |
+            dist/EdgePowerMeter-arm64
+            dist/*.deb
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+
+      - name: Build executable
+        run: python build.py exe
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-builds
+          path: dist/EdgePowerMeter.exe
+
+  build-macos-intel:
+    runs-on: macos-13  # Intel Mac
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+
+      - name: Build executable
+        run: python build.py exe
+
+      - name: Create macOS .app bundle
+        run: |
+          mkdir -p dist/EdgePowerMeter.app/Contents/MacOS
+          mkdir -p dist/EdgePowerMeter.app/Contents/Resources
+          cp dist/EdgePowerMeter dist/EdgePowerMeter.app/Contents/MacOS/
+          chmod +x dist/EdgePowerMeter.app/Contents/MacOS/EdgePowerMeter
+          cat > dist/EdgePowerMeter.app/Contents/Info.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>EdgePowerMeter</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.danielrossi.edgepowermeter</string>
+              <key>CFBundleName</key>
+              <string>EdgePowerMeter</string>
+              <key>CFBundleVersion</key>
+              <string>${{ github.ref_name }}</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>10.15</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Create DMG
+        run: |
+          hdiutil create -volname "EdgePowerMeter" -srcfolder dist/EdgePowerMeter.app -ov -format UDZO dist/EdgePowerMeter-intel.dmg
+
+      - name: Upload macOS Intel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-builds
+          path: dist/EdgePowerMeter-intel.dmg
+
+  build-macos-arm:
+    runs-on: macos-14  # Apple Silicon (M1/M2)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+
+      - name: Build executable
+        run: python build.py exe
+
+      - name: Create macOS .app bundle
+        run: |
+          mkdir -p dist/EdgePowerMeter.app/Contents/MacOS
+          mkdir -p dist/EdgePowerMeter.app/Contents/Resources
+          cp dist/EdgePowerMeter dist/EdgePowerMeter.app/Contents/MacOS/
+          chmod +x dist/EdgePowerMeter.app/Contents/MacOS/EdgePowerMeter
+          cat > dist/EdgePowerMeter.app/Contents/Info.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>EdgePowerMeter</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.danielrossi.edgepowermeter</string>
+              <key>CFBundleName</key>
+              <string>EdgePowerMeter</string>
+              <key>CFBundleVersion</key>
+              <string>${{ github.ref_name }}</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>11.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Create DMG
+        run: |
+          hdiutil create -volname "EdgePowerMeter" -srcfolder dist/EdgePowerMeter.app -ov -format UDZO dist/EdgePowerMeter-apple-silicon.dmg
+
+      - name: Upload macOS ARM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm-builds
+          path: dist/EdgePowerMeter-apple-silicon.dmg
+
+  upload-release:
+    needs: [build-linux-amd64, build-linux-arm64, build-windows, build-macos-intel, build-macos-arm]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Rename artifacts with version
+        run: |
+          mkdir -p release
+          VERSION=${{ steps.version.outputs.VERSION }}
+          
+          # Linux amd64
+          cp artifacts/linux-amd64-builds/EdgePowerMeter release/EdgePowerMeter-${VERSION}-linux-amd64
+          cp artifacts/linux-amd64-builds/*.deb release/ 2>/dev/null || true
+          
+          # Linux arm64
+          cp artifacts/linux-arm64-builds/EdgePowerMeter-arm64 release/EdgePowerMeter-${VERSION}-linux-arm64
+          for f in artifacts/linux-arm64-builds/*.deb; do
+            [ -f "$f" ] && cp "$f" release/
+          done
+          
+          # Windows
+          cp artifacts/windows-builds/EdgePowerMeter.exe release/EdgePowerMeter-${VERSION}-windows-amd64.exe
+          
+          # macOS Intel
+          cp artifacts/macos-intel-builds/EdgePowerMeter-intel.dmg release/EdgePowerMeter-${VERSION}-macos-intel.dmg
+          
+          # macOS Apple Silicon
+          cp artifacts/macos-arm-builds/EdgePowerMeter-apple-silicon.dmg release/EdgePowerMeter-${VERSION}-macos-apple-silicon.dmg
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

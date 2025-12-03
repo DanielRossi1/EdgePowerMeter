@@ -91,17 +91,35 @@ def build_pyinstaller():
         sys.exit(1)
 
 
+def get_architecture() -> str:
+    """Detect current CPU architecture."""
+    import platform
+    machine = platform.machine().lower()
+    if machine in ('x86_64', 'amd64'):
+        return 'amd64'
+    elif machine in ('aarch64', 'arm64'):
+        return 'arm64'
+    elif machine.startswith('arm'):
+        return 'armhf'
+    else:
+        return machine
+
+
 def create_deb_structure():
     """Create .deb package structure."""
     print(f"📦 Creating .deb package for {APP_NAME}...")
     
     # Check if executable exists
     exe_path = DIST_DIR / APP_NAME
+    # Also check for ARM64 renamed executable
+    if not exe_path.exists():
+        exe_path = DIST_DIR / f"{APP_NAME}-arm64"
     if not exe_path.exists():
         print("❌ Executable not found. Run build first!")
         sys.exit(1)
     
-    deb_name = f"{APP_NAME.lower()}_{VERSION}_amd64"
+    arch = get_architecture()
+    deb_name = f"{APP_NAME.lower()}_{VERSION}_{arch}"
     deb_dir = DIST_DIR / deb_name
     
     # Create directory structure
@@ -119,7 +137,7 @@ def create_deb_structure():
 Version: {VERSION}
 Section: electronics
 Priority: optional
-Architecture: amd64
+Architecture: {arch}
 Maintainer: {AUTHOR}
 Description: {DESCRIPTION}
  EdgePowerMeter is a real-time power monitoring application

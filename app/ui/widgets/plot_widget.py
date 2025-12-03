@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import pyqtgraph as pg
-from pyqtgraph.graphicsItems.DateAxisItem import DateAxisItem
 from PySide6.QtCore import Qt
 
 from ..theme import ThemeColors
@@ -49,9 +48,9 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         
         # Voltage plot
         self.plot_v = self.addPlot(
-            row=0, col=0, title="Voltage [V]",
-            axisItems={'bottom': DateAxisItem(orientation='bottom')}
+            row=0, col=0, title="Voltage [V]"
         )
+        self.plot_v.setLabel('bottom', 'Time [s]')
         self._style_plot(self.plot_v, self.theme.chart_voltage)
         self.curve_v = self.plot_v.plot(
             pen=pg.mkPen(self.theme.chart_voltage, width=2)
@@ -61,9 +60,9 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         
         # Current plot
         self.plot_i = self.addPlot(
-            row=1, col=0, title="Current [A]",
-            axisItems={'bottom': DateAxisItem(orientation='bottom')}
+            row=1, col=0, title="Current [A]"
         )
+        self.plot_i.setLabel('bottom', 'Time [s]')
         self._style_plot(self.plot_i, self.theme.chart_current)
         self.curve_i = self.plot_i.plot(
             pen=pg.mkPen(self.theme.chart_current, width=2)
@@ -73,9 +72,9 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         
         # Power plot
         self.plot_p = self.addPlot(
-            row=2, col=0, title="Power [W]",
-            axisItems={'bottom': DateAxisItem(orientation='bottom')}
+            row=2, col=0, title="Power [W]"
         )
+        self.plot_p.setLabel('bottom', 'Time [s]')
         self._style_plot(self.plot_p, self.theme.chart_power)
         self.curve_p = self.plot_p.plot(
             pen=pg.mkPen(self.theme.chart_power, width=2)
@@ -268,6 +267,11 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self._auto_scroll = True
         self._window_seconds = self.DEFAULT_WINDOW_SECONDS
         self._last_data_time = 0.0
+        
+        # Reset X range to start from 0
+        self._is_panning = True
+        self.plot_v.setXRange(0, self._window_seconds, padding=0)
+        self._is_panning = False
     
     def reset_to_live(self) -> None:
         """Reset to live auto-scrolling view (same as middle-click)."""

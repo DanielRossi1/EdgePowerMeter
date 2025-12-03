@@ -20,6 +20,7 @@ class MeasurementRecord:
     """Single measurement with timestamp."""
     timestamp: datetime
     unix_time: float
+    relative_time: float  # Time from acquisition start (seconds)
     voltage: float
     current: float
     power: float
@@ -207,8 +208,13 @@ class CSVImporter:
                     "Timestamp, Voltage, Current, Power"
                 )
             
+            # Detect if file has RelativeTime column (5 columns)
+            has_relative_time_col = len(header) >= 5 and 'relative' in header[1].lower()
+            
             # Parse data rows
             line_num = 1
+            start_time: float = 0.0
+            
             for row in reader:
                 line_num += 1
                 
@@ -218,16 +224,30 @@ class CSVImporter:
                 try:
                     # Clean values (remove units if present)
                     ts_str = row[0].strip()
-                    voltage = float(row[1].strip().replace(',', '.'))
-                    current = float(row[2].strip().replace(',', '.'))
-                    power = float(row[3].strip().replace(',', '.'))
+                    
+                    # Handle both old format (4 cols) and new format (5 cols with RelativeTime)
+                    if has_relative_time_col and len(row) >= 5:
+                        # New format: Timestamp, RelativeTime, Voltage, Current, Power
+                        voltage = float(row[2].strip().replace(',', '.'))
+                        current = float(row[3].strip().replace(',', '.'))
+                        power = float(row[4].strip().replace(',', '.'))
+                    else:
+                        # Old format: Timestamp, Voltage, Current, Power
+                        voltage = float(row[1].strip().replace(',', '.'))
+                        current = float(row[2].strip().replace(',', '.'))
+                        power = float(row[3].strip().replace(',', '.'))
                     
                     timestamp = cls.parse_timestamp(ts_str)
                     unix_time = timestamp.timestamp()
                     
+                    # Track start time for relative time calculation
+                    if start_time == 0.0:
+                        start_time = unix_time
+                    
                     records.append(MeasurementRecord(
                         timestamp=timestamp,
                         unix_time=unix_time,
+                        relative_time=unix_time - start_time,
                         voltage=voltage,
                         current=current,
                         power=power
@@ -242,6 +262,13 @@ class CSVImporter:
         # Sort by timestamp to ensure correct order
         records.sort(key=lambda r: r.unix_time)
         
+        # Recalculate relative times after sorting
+        if records:
+            start_time = records[0].unix_time
+            for r in records:
+                # Use object.__setattr__ since dataclass might be frozen
+                object.__setattr__(r, 'relative_time', r.unix_time - start_time)
+        
         return records
 
 
@@ -250,13 +277,17 @@ class ReportGenerator:
     
     def export_csv(self, filepath: Path, records: List[MeasurementRecord], 
                    separator: str = ',') -> None:
-        """Export measurements to CSV file."""
+        """Export measurements to CSV file.
+        
+        Includes both absolute timestamp and relative time (seconds from start).
+        """
         with open(filepath, 'w', newline='') as f:
             writer = csv.writer(f, delimiter=separator)
-            writer.writerow(['Timestamp', 'Voltage[V]', 'Current[A]', 'Power[W]'])
+            writer.writerow(['Timestamp', 'RelativeTime[s]', 'Voltage[V]', 'Current[A]', 'Power[W]'])
             for r in records:
                 writer.writerow([
                     r.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                    f"{r.relative_time:.6f}",
                     f"{r.voltage:.6f}",
                     f"{r.current:.6f}",
                     f"{r.power:.6f}",
@@ -479,7 +510,6 @@ class ReportGenerator:
         import matplotlib
         matplotlib.use('Agg')  # Non-interactive backend
         import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
         from reportlab.platypus import Image
         from reportlab.lib.units import mm
         
@@ -489,72 +519,88 @@ class ReportGenerator:
             step = len(records) // MAX_GRAPH_POINTS
             records = records[::step]
         
-        # Extract data
-        timestamps = [r.timestamp for r in records]
+        # Extract data - use relative_time for X axis (starts from 0)
+        times = [r.relative_time for r in records]
         voltages = [r.voltage for r in records]
         currents = [r.current for r in records]
         powers = [r.power for r in records]
         
         # Graph settings
         fig_width = 170 * mm / 25.4  # Convert mm to inches
-        fig_height = 60 * mm / 25.4
+        fig_height = 70 * mm / 25.4  # Slightly taller for better readability
         
         images = []
         
-        # Define graph configurations
+        # Define graph configurations - darker, more visible colors
         graphs = [
-            ('Voltage [V]', voltages, '#58a6ff'),  # Blue
-            ('Current [A]', currents, '#f78166'),  # Orange
-            ('Power [W]', powers, '#3fb950'),      # Green
+            ('Voltage [V]', voltages, '#1f77b4', '#0d3d6e'),  # Blue
+            ('Current [A]', currents, '#d62728', '#8b1a1a'),  # Red
+            ('Power [W]', powers, '#2ca02c', '#1a5c1a'),      # Green
         ]
         
-        for title, data, color in graphs:
+        for title, data, line_color, fill_color in graphs:
             fig, ax = plt.subplots(figsize=(fig_width, fig_height))
             
-            ax.plot(timestamps, data, color=color, linewidth=0.8)
-            ax.fill_between(timestamps, data, alpha=0.2, color=color)
+            # Set white background
+            ax.set_facecolor('white')
+            fig.patch.set_facecolor('white')
             
-            ax.set_ylabel(title, fontsize=10)
-            ax.set_xlabel('Time', fontsize=9)
-            ax.grid(True, alpha=0.3)
+            # Thicker line for better visibility
+            ax.plot(times, data, color=line_color, linewidth=1.5)
+            ax.fill_between(times, data, alpha=0.3, color=fill_color)
             
-            # Format x-axis based on duration
-            duration = (timestamps[-1] - timestamps[0]).total_seconds()
-            if duration < 60:
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-            elif duration < 3600:
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-            else:
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            ax.set_ylabel(title, fontsize=11, fontweight='bold')
+            ax.set_xlabel('Time [s]', fontsize=10)
+            ax.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
             
-            plt.xticks(rotation=45, ha='right', fontsize=8)
-            plt.yticks(fontsize=8)
+            # Format x-axis based on duration (in seconds from 0)
+            duration = times[-1] - times[0] if times else 0
+            if duration > 3600:
+                # Show in minutes for long recordings
+                ax.set_xlabel('Time [min]', fontsize=10)
+                ax.set_xticks([t for t in range(0, int(duration) + 1, int(duration / 10) or 1)])
+                ax.set_xticklabels([f'{t/60:.1f}' for t in ax.get_xticks()])
+            
+            plt.xticks(fontsize=9)
+            plt.yticks(fontsize=9)
             
             # Add min/max/avg annotations
             min_val = min(data)
             max_val = max(data)
             avg_val = sum(data) / len(data)
             
-            ax.axhline(y=avg_val, color=color, linestyle='--', alpha=0.5, linewidth=0.8)
+            # Average line - more visible
+            ax.axhline(y=avg_val, color=line_color, linestyle='--', alpha=0.7, linewidth=1.2)
+            
+            # Stats box with better formatting
+            stats_text = f'Min: {min_val:.4f}  |  Max: {max_val:.4f}  |  Avg: {avg_val:.4f}'
             ax.text(
                 0.02, 0.95, 
-                f'Min: {min_val:.4f}  Max: {max_val:.4f}  Avg: {avg_val:.4f}',
+                stats_text,
                 transform=ax.transAxes,
-                fontsize=8,
+                fontsize=9,
+                fontweight='bold',
                 verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+                bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                         edgecolor=line_color, alpha=0.9, linewidth=1.5)
             )
+            
+            # Add some padding to y-axis
+            y_range = max_val - min_val
+            if y_range > 0:
+                ax.set_ylim(min_val - y_range * 0.1, max_val + y_range * 0.15)
             
             plt.tight_layout()
             
-            # Save to buffer
+            # Save to buffer - higher DPI for better quality
             buf = BytesIO()
-            fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            fig.savefig(buf, format='png', dpi=200, bbox_inches='tight', 
+                       facecolor='white', edgecolor='none')
             buf.seek(0)
             plt.close(fig)
             
             # Create reportlab Image
-            img = Image(buf, width=170*mm, height=60*mm)
+            img = Image(buf, width=170*mm, height=70*mm)
             images.append(img)
         
         return images

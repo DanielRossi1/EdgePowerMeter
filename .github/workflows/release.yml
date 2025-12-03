@@ -223,15 +223,15 @@ jobs:
           </plist>
           EOF
 
-      - name: Create DMG
+      - name: Create ZIP archive
         run: |
-          hdiutil create -volname "EdgePowerMeter" -srcfolder dist/EdgePowerMeter.app -ov -format UDZO dist/EdgePowerMeter-apple-silicon.dmg
+          cd dist && zip -r EdgePowerMeter-apple-silicon.zip EdgePowerMeter.app
 
       - name: Upload macOS ARM artifacts
         uses: actions/upload-artifact@v4
         with:
           name: macos-arm-builds
-          path: dist/EdgePowerMeter-apple-silicon.dmg
+          path: dist/EdgePowerMeter-apple-silicon.zip
 
   upload-release:
     needs: [build-linux-amd64, build-linux-arm64, build-windows, build-macos-intel, build-macos-arm]
@@ -272,7 +272,7 @@ jobs:
           cp artifacts/macos-intel-builds/EdgePowerMeter-intel.dmg release/EdgePowerMeter-${VERSION}-macos-intel.dmg
           
           # macOS Apple Silicon
-          cp artifacts/macos-arm-builds/EdgePowerMeter-apple-silicon.dmg release/EdgePowerMeter-${VERSION}-macos-apple-silicon.dmg
+          cp artifacts/macos-arm-builds/EdgePowerMeter-apple-silicon.zip release/EdgePowerMeter-${VERSION}-macos-apple-silicon.zip
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v1

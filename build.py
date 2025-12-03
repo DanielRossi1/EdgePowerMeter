@@ -34,12 +34,29 @@ def build_pyinstaller():
     """Build executable using PyInstaller."""
     print(f"[BUILD] Building {APP_NAME} with PyInstaller...")
     
+    # Select icon based on platform
+    icons_dir = ROOT / "assets" / "icons"
+    if sys.platform == "win32":
+        icon_path = icons_dir / "EdgePowerMeter.ico"
+    elif sys.platform == "darwin":
+        icon_path = icons_dir / "EdgePowerMeter.icns"
+    else:
+        icon_path = icons_dir / "EdgePowerMeter.png"
+    
+    assets_path = ROOT / "assets"
+    
+    # Path separator: ';' on Windows, ':' on Unix
+    data_sep = ";" if sys.platform == "win32" else ":"
+    
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--name", APP_NAME,
         "--onefile",           # Single executable
         "--windowed",          # No console window (GUI app)
         "--clean",
+        "--icon", str(icon_path),
+        # Include assets folder for runtime icon
+        "--add-data", f"{assets_path}{data_sep}assets",
         # Hidden imports for PySide6 and pyqtgraph
         "--hidden-import", "PySide6.QtCore",
         "--hidden-import", "PySide6.QtGui", 
@@ -132,10 +149,20 @@ def create_deb_structure():
     (deb_dir / "usr" / "bin").mkdir(parents=True, exist_ok=True)
     (deb_dir / "usr" / "share" / "applications").mkdir(parents=True, exist_ok=True)
     (deb_dir / "usr" / "share" / "doc" / APP_NAME.lower()).mkdir(parents=True, exist_ok=True)
+    (deb_dir / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps").mkdir(parents=True, exist_ok=True)
+    (deb_dir / "usr" / "share" / "icons" / "hicolor" / "scalable" / "apps").mkdir(parents=True, exist_ok=True)
     
     # Copy executable
     shutil.copy(exe_path, deb_dir / "usr" / "bin" / APP_NAME.lower())
     (deb_dir / "usr" / "bin" / APP_NAME.lower()).chmod(0o755)
+    
+    # Copy icons
+    icon_png = ROOT / "assets" / "icons" / "EdgePowerMeter.png"
+    icon_svg = ROOT / "assets" / "icons" / "EdgePowerMeter.svg"
+    if icon_png.exists():
+        shutil.copy(icon_png, deb_dir / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps" / f"{APP_NAME.lower()}.png")
+    if icon_svg.exists():
+        shutil.copy(icon_svg, deb_dir / "usr" / "share" / "icons" / "hicolor" / "scalable" / "apps" / f"{APP_NAME.lower()}.svg")
     
     # Create control file
     control_content = f"""Package: {APP_NAME.lower()}
@@ -156,6 +183,7 @@ Description: {DESCRIPTION}
 Name={APP_NAME}
 Comment={DESCRIPTION}
 Exec=/usr/bin/{APP_NAME.lower()}
+Icon={APP_NAME.lower()}
 Terminal=false
 Type=Application
 Categories=Utility;Electronics;

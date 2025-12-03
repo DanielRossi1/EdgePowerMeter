@@ -73,6 +73,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{__version__}")
         self.setMinimumSize(1200, 800)
         self.resize(1400, 900)
+        
+        # Set window icon - handle both development and PyInstaller bundle
+        import sys
+        if getattr(sys, 'frozen', False):
+            # Running as PyInstaller bundle
+            base_path = Path(sys._MEIPASS)
+        else:
+            # Running in development
+            base_path = Path(__file__).parent.parent.parent
+        
+        icon_path = base_path / "assets" / "icons" / "icon.png"
+        if icon_path.exists():
+            self.setWindowIcon(QtGui.QIcon(str(icon_path)))
+        
         self._apply_theme()
         
         central = QtWidgets.QWidget()

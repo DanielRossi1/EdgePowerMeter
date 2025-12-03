@@ -9,7 +9,7 @@ description = "Real-time power monitoring application for embedded AI workloads"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "Daniel Rossi", email = ""}
+    {name = "Daniel Rossi"}
 ]
 keywords = ["power", "monitoring", "embedded", "ina226", "esp32", "serial"]
 classifiers = [

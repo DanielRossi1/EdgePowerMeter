@@ -108,16 +108,19 @@ The main application window containing:
 
 **`PlotWidget`** (`app/ui/widgets/plot_widget.py`)
 - Custom pyqtgraph widget with three synchronized panels
-- Y-axis locked during X-axis zoom (auto-scales to visible data)
-- Middle-click to reset X-axis auto-scroll
-- Theme switching support
-- DateTimeAxis for timestamps
+- OpenGL acceleration for smooth 60+ FPS rendering (if PyOpenGL installed)
+- Antialiasing for smooth line rendering
+- Event-driven updates triggered by user pan/zoom interactions
+- Y-axis auto-scales to visible data
+- Middle-click to reset X-axis to live auto-scroll
+- Relative time axis (starts from 0 seconds)
 - Region selector for data export
 
 **`PlotBuffers`** (`app/ui/widgets/plot_buffers.py`)
 - Manages data for real-time plotting
-- Millisecond-precision timestamps
-- Rejects out-of-order samples to prevent artifacts
+- Relative time tracking from acquisition start
+- Efficient numpy array caching
+- Binary search for visible data slicing
 
 **`MainWindow`**
 - Main application window

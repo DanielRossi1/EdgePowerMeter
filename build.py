@@ -54,6 +54,10 @@ def build_pyinstaller():
         "--hidden-import", "matplotlib.backends.backend_agg",
         "--hidden-import", "PIL",
         "--hidden-import", "PIL.Image",
+        "--hidden-import", "OpenGL",
+        "--hidden-import", "OpenGL.GL",
+        "--hidden-import", "OpenGL.platform.glx",
+        "--hidden-import", "OpenGL.platform.egl",
         # Collect all matplotlib and PIL data files
         "--collect-all", "matplotlib",
         "--collect-all", "PIL",

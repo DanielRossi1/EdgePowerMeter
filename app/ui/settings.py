@@ -26,10 +26,8 @@ class AppSettings:
     power_unit: str = "W"
     
     # Display
-    plot_points: int = 1000
-    update_interval_ms: int = 100
+    plot_points: int = 5000  # Max points to render in view
     show_grid: bool = True
-    antialiasing: bool = True
     
     # Average Power
     use_moving_average: bool = True
@@ -288,29 +286,22 @@ class SettingsDialog(QDialog):
         grid.setSpacing(12)
         
         # Plot points
-        grid.addWidget(QLabel("Max plot points:"), 0, 0)
+        grid.addWidget(QLabel("Max visible points:"), 0, 0)
         self.plot_points_spin = QSpinBox()
-        self.plot_points_spin.setRange(100, 10000)
-        self.plot_points_spin.setSingleStep(100)
-        self.plot_points_spin.setToolTip("Maximum number of points shown on plots")
+        self.plot_points_spin.setRange(500, 50000)
+        self.plot_points_spin.setSingleStep(500)
+        self.plot_points_spin.setToolTip("Maximum points rendered in the visible window")
         grid.addWidget(self.plot_points_spin, 0, 1)
-        
-        # Update interval
-        grid.addWidget(QLabel("Update interval (ms):"), 1, 0)
-        self.update_interval_spin = QSpinBox()
-        self.update_interval_spin.setRange(50, 1000)
-        self.update_interval_spin.setSingleStep(50)
-        self.update_interval_spin.setToolTip("Plot refresh rate in milliseconds")
-        grid.addWidget(self.update_interval_spin, 1, 1)
         
         # Show grid
         self.show_grid_check = QCheckBox("Show grid lines")
-        grid.addWidget(self.show_grid_check, 2, 0, 1, 2)
+        grid.addWidget(self.show_grid_check, 1, 0, 1, 2)
         
-        # Antialiasing
-        self.antialiasing_check = QCheckBox("Enable antialiasing")
-        self.antialiasing_check.setToolTip("Smoother lines but may impact performance")
-        grid.addWidget(self.antialiasing_check, 3, 0, 1, 2)
+        # Info label about event-driven updates
+        info_label = QLabel("📊 Plot updates automatically when new data arrives (up to 60 FPS)")
+        info_label.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        info_label.setWordWrap(True)
+        grid.addWidget(info_label, 2, 0, 1, 2)
         
         layout.addWidget(plot_group)
         
@@ -512,9 +503,7 @@ class SettingsDialog(QDialog):
         
         # Display
         self.plot_points_spin.setValue(self.settings.plot_points)
-        self.update_interval_spin.setValue(self.settings.update_interval_ms)
         self.show_grid_check.setChecked(self.settings.show_grid)
-        self.antialiasing_check.setChecked(self.settings.antialiasing)
         
         # Moving average
         self.moving_avg_check.setChecked(self.settings.use_moving_average)
@@ -549,9 +538,7 @@ class SettingsDialog(QDialog):
         
         # Display
         self.settings.plot_points = self.plot_points_spin.value()
-        self.settings.update_interval_ms = self.update_interval_spin.value()
         self.settings.show_grid = self.show_grid_check.isChecked()
-        self.settings.antialiasing = self.antialiasing_check.isChecked()
         
         # Moving average
         self.settings.use_moving_average = self.moving_avg_check.isChecked()

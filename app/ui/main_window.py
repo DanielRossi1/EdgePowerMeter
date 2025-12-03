@@ -29,7 +29,7 @@ from .widgets import PlotBuffers, PlotWidget, StatCard, PortDiscovery
 class MainWindow(QtWidgets.QMainWindow):
     """Main application window."""
     
-    PLOT_UPDATE_MS = 100  # Update plots every 100ms (10 FPS) for smooth performance
+    MIN_PLOT_INTERVAL_MS = 16  # Max 60 FPS (~16ms between updates)
     STOP_TIMEOUT_MS = 3000
     MAX_DATA_POINTS = 100000  # Max points before warning
     
@@ -38,7 +38,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_state()
         self._setup_ui()
         self._connect_signals()
-        self._start_timers()
+        self._setup_plot_throttle()
         self._refresh_ports()
     
     def _init_state(self) -> None:
@@ -52,6 +52,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Flag to track if we're actively acquiring
         self._acquiring = False
         self._acq_start_time: float = 0.0  # perf_counter at acquisition start
+        
+        # Rate limiting for plot updates (max 60 FPS)
+        self._last_plot_update: float = 0.0
         
         # Running statistics for efficient avg power calculation
         self._power_sum: float = 0.0
@@ -264,12 +267,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clear_btn.clicked.connect(self._clear_data)
         
         self.settings_btn.clicked.connect(self._open_settings)
+        
+        # Connect plot view changes (pan, zoom) to trigger re-render
+        self.plot_widget.view_changed.connect(self._request_plot_update)
     
-    def _start_timers(self) -> None:
-        self.plot_timer = QtCore.QTimer()
-        self.plot_timer.setInterval(self.PLOT_UPDATE_MS)
-        self.plot_timer.timeout.connect(self._update_ui)
-        self.plot_timer.start()
+    def _setup_plot_throttle(self) -> None:
+        """Setup event-driven plot updates with rate limiting."""
+        # Timer fires only when plot is dirty, with rate limiting
+        self._plot_timer = QtCore.QTimer()
+        self._plot_timer.setSingleShot(True)
+        self._plot_timer.timeout.connect(self._do_plot_update)
+    
+    def _request_plot_update(self) -> None:
+        """Request a plot update (rate-limited to 60 FPS max)."""
+        now = time.perf_counter()
+        elapsed_ms = (now - self._last_plot_update) * 1000
+        
+        if elapsed_ms >= self.MIN_PLOT_INTERVAL_MS:
+            self._do_plot_update()
+        elif not self._plot_timer.isActive():
+            wait_ms = int(self.MIN_PLOT_INTERVAL_MS - elapsed_ms) + 1
+            self._plot_timer.start(wait_ms)
+    
+    def _do_plot_update(self) -> None:
+        """Actually perform the plot update."""
+        self._plot_dirty = False
+        self._last_plot_update = time.perf_counter()
+        
+        # Always update with current buffers (works during and after acquisition)
+        if not self.buffers.is_empty:
+            self.plot_widget.update_data(self.buffers)
+        self._update_selection_stats()
     
     # -------------------------------------------------------------------------
     # Settings
@@ -311,6 +339,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update power window size for moving average
         new_window = deque(self._power_window, maxlen=settings.moving_average_window)
         self._power_window = new_window
+        
+        # Request plot update to apply any visual changes
+        self._request_plot_update()
     
     # -------------------------------------------------------------------------
     # Connection
@@ -419,19 +450,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._power_sum += p
         self._power_window.append(p)
         
-        # Update UI cards (lightweight)
+        # Request plot update (rate-limited to 60 FPS)
+        self._request_plot_update()
+        
+        # Update stat cards every 5 samples (~20Hz at 100Hz input)
+        n = len(self.full_data)
+        if n % 5 == 0:
+            self._update_stat_cards(v, i, p)
+        
+        # Update sample count every 50 samples
+        if n % 50 == 0:
+            self.samples_label.setText(f"Samples: {n:,}")
+    
+    def _update_stat_cards(self, v: float, i: float, p: float) -> None:
+        """Update the stat cards with current values."""
         self.voltage_card.set_value(v)
         self.current_card.set_value(i)
         self.power_card.set_value(p)
-        
-        # Calculate average power efficiently
-        avg_power = self._calculate_avg_power()
-        self.avg_power_card.set_value(avg_power)
-        
-        # Update sample count less frequently (every 10 samples)
-        n = len(self.full_data)
-        if n % 10 == 0:
-            self.samples_label.setText(f"Samples: {n:,}")
+        self.avg_power_card.set_value(self._calculate_avg_power())
     
     def _calculate_avg_power(self) -> float:
         """Calculate average power efficiently using running statistics."""
@@ -450,10 +486,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_error(self, msg: str) -> None:
         QtWidgets.QMessageBox.critical(self, "Serial Error", msg)
         self._stop_acquisition()
-    
-    def _update_ui(self) -> None:
-        self.plot_widget.update_data(self.buffers)
-        self._update_selection_stats()
     
     def _clear_data(self) -> None:
         self.buffers.clear()
@@ -657,7 +689,23 @@ class MainWindow(QtWidgets.QMainWindow):
         )
     
     def _run_export(self, export_func, success_msg: str, progress_msg: str) -> None:
-        """Run export function with progress dialog."""
+        """Run export function in background thread with progress dialog."""
+        from PySide6.QtCore import QThread, Signal
+        
+        class ExportWorker(QThread):
+            finished = Signal(bool, str)  # success, error_message
+            
+            def __init__(self, func):
+                super().__init__()
+                self.func = func
+            
+            def run(self):
+                try:
+                    self.func()
+                    self.finished.emit(True, "")
+                except Exception as e:
+                    self.finished.emit(False, str(e))
+        
         progress = QtWidgets.QProgressDialog(progress_msg, None, 0, 0, self)
         progress.setWindowTitle("Exporting")
         progress.setWindowModality(QtCore.Qt.WindowModal)
@@ -665,16 +713,17 @@ class MainWindow(QtWidgets.QMainWindow):
         progress.setCancelButton(None)
         progress.show()
         
-        # Process events to show dialog
-        QtCore.QCoreApplication.processEvents()
+        def on_finished(success: bool, error: str):
+            progress.close()
+            worker.deleteLater()
+            if success:
+                QtWidgets.QMessageBox.information(self, "Success", success_msg)
+            else:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Export failed: {error}")
         
-        try:
-            export_func()
-            progress.close()
-            QtWidgets.QMessageBox.information(self, "Success", success_msg)
-        except Exception as e:
-            progress.close()
-            QtWidgets.QMessageBox.critical(self, "Error", f"Export failed: {e}")
+        worker = ExportWorker(export_func)
+        worker.finished.connect(on_finished)
+        worker.start()
     
     # -------------------------------------------------------------------------
     # Cleanup

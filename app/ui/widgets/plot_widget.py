@@ -6,8 +6,19 @@ from typing import Optional, Tuple
 import pyqtgraph as pg
 from PySide6.QtCore import Qt
 
+# Enable OpenGL acceleration for smooth 60+ FPS rendering
+_OPENGL_AVAILABLE = False
+try:
+    import OpenGL
+    pg.setConfigOptions(useOpenGL=True, enableExperimental=True)
+    _OPENGL_AVAILABLE = True
+except ImportError:
+    pass  # OpenGL not available, use software rendering
+
 from ..theme import ThemeColors
 from .plot_buffers import PlotBuffers
+
+from PySide6.QtCore import Signal
 
 
 class PlotWidget(pg.GraphicsLayoutWidget):
@@ -22,6 +33,9 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         - All three plots synchronized
     """
     
+    # Signal emitted when view needs refresh (pan, zoom, resize)
+    view_changed = Signal()
+    
     # Time window settings
     DEFAULT_WINDOW_SECONDS = 10.0
     MIN_WINDOW_SECONDS = 1.0
@@ -35,15 +49,16 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         
         # Time window state
         self._window_seconds = self.DEFAULT_WINDOW_SECONDS
-        self._auto_scroll = True  # Follow live data
-        self._last_data_time: float = 0.0
-        self._is_panning = False
+        self._auto_scroll = True
+        self._last_data_time = 0.0
+        self._updating = False
         
         self._setup_plots()
         self.region: Optional[pg.LinearRegionItem] = None
     
     def _setup_plots(self) -> None:
         """Create the three plot panels."""
+        # Enable antialiasing for smooth lines
         pg.setConfigOptions(antialias=True)
         
         # Voltage plot
@@ -55,6 +70,7 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self.curve_v = self.plot_v.plot(
             pen=pg.mkPen(self.theme.chart_voltage, width=2)
         )
+        self.curve_v.setClipToView(True)  # Only render visible points
         
         self.nextRow()
         
@@ -67,6 +83,7 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self.curve_i = self.plot_i.plot(
             pen=pg.mkPen(self.theme.chart_current, width=2)
         )
+        self.curve_i.setClipToView(True)
         
         self.nextRow()
         
@@ -79,6 +96,7 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self.curve_p = self.plot_p.plot(
             pen=pg.mkPen(self.theme.chart_power, width=2)
         )
+        self.curve_p.setClipToView(True)
         
         # Link X-axes so all plots pan together
         self.plot_i.setXLink(self.plot_v)
@@ -90,8 +108,8 @@ class PlotWidget(pg.GraphicsLayoutWidget):
             plot.setMouseEnabled(x=True, y=False)
             plot.enableAutoRange(axis='y', enable=True)
         
-        # Connect to pan events (detect when user drags)
-        self.plot_v.sigXRangeChanged.connect(self._on_x_range_changed)
+        # Connect to ViewBox signal for pan/zoom detection
+        self.plot_v.getViewBox().sigRangeChanged.connect(self._on_view_changed)
     
     def _style_plot(self, plot: pg.PlotItem, color: str) -> None:
         """Apply theme styling to a plot panel."""
@@ -103,41 +121,55 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         plot.setTitle(plot.titleLabel.text, color=color, size='11pt')
         plot.getViewBox().setBackgroundColor(self.theme.bg_secondary)
     
-    def _on_x_range_changed(self, view, range_) -> None:
-        """Called when user pans the view."""
-        if self._is_panning or not self._last_data_time:
+    def _on_view_changed(self, vb, range_) -> None:
+        """Called when ViewBox range changes (user pan/zoom)."""
+        if self._updating:
             return
+            
+        # Check if near live edge
+        x_range = range_[0]
+        if self._last_data_time > 0:
+            at_live_edge = x_range[1] >= self._last_data_time - 0.5
+            if not at_live_edge:
+                self._auto_scroll = False
         
-        # Check if we're near the live edge (within 0.5 seconds)
-        view_end = range_[1]
-        at_live_edge = (view_end >= self._last_data_time - 0.5)
-        
-        # If user dragged away from live edge, disable auto-scroll
-        if not at_live_edge:
-            self._auto_scroll = False
+        self.view_changed.emit()
     
     def update_data(self, buffers: PlotBuffers) -> None:
-        """Update plots with buffered data."""
+        """Update plots with visible portion of data."""
         if buffers.is_empty:
             return
         
-        # Get all data as numpy arrays
         xs, vs, cs, ps = buffers.get_arrays()
-        
         if len(xs) == 0:
             return
         
-        # Update curves with all data
-        self.curve_v.setData(xs, vs)
-        self.curve_i.setData(xs, cs)
-        self.curve_p.setData(xs, ps)
+        self._updating = True
         
-        # Track latest data time
         self._last_data_time = xs[-1]
         
-        # Update view window if auto-scrolling
+        # If auto-scroll, update view range to follow live data
         if self._auto_scroll:
-            self._update_view_range()
+            t_end = self._last_data_time
+            t_start = t_end - self._window_seconds
+            self.plot_v.setXRange(t_start, t_end, padding=0)
+        
+        # Get visible range and render only that portion
+        view_range = self.plot_v.viewRange()[0]
+        t_start = view_range[0] - 0.5
+        t_end = view_range[1] + 0.5
+        
+        # Find visible slice
+        import numpy as np
+        idx_start = max(0, np.searchsorted(xs, t_start) - 1)
+        idx_end = min(len(xs), np.searchsorted(xs, t_end) + 1)
+        
+        # Update curves with only visible data
+        self.curve_v.setData(xs[idx_start:idx_end], vs[idx_start:idx_end])
+        self.curve_i.setData(xs[idx_start:idx_end], cs[idx_start:idx_end])
+        self.curve_p.setData(xs[idx_start:idx_end], ps[idx_start:idx_end])
+        
+        self._updating = False
     
     def _update_view_range(self) -> None:
         """Update the visible time range to follow live data."""
@@ -193,9 +225,21 @@ class PlotWidget(pg.GraphicsLayoutWidget):
             self._auto_scroll = True
             self._window_seconds = self.DEFAULT_WINDOW_SECONDS
             self._update_view_range()
+            self.view_changed.emit()
             event.accept()
         else:
             super().mousePressEvent(event)
+    
+    def mouseReleaseEvent(self, event) -> None:
+        """Handle mouse release - ensure final update after drag."""
+        super().mouseReleaseEvent(event)
+        # Force update when user finishes dragging
+        self.view_changed.emit()
+    
+    def resizeEvent(self, event) -> None:
+        """Handle resize events - trigger re-render."""
+        super().resizeEvent(event)
+        self.view_changed.emit()
     
     # -------------------------------------------------------------------------
     # Region selector for data export

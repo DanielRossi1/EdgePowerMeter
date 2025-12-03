@@ -53,6 +53,7 @@
 
 ### Software
 - 📊 Real-time voltage, current, and power graphs
+- 🚀 **OpenGL accelerated** rendering for smooth 60+ FPS
 - 📈 Live statistics with min/max/average values
 - 💾 CSV data export with full measurement history
 - 📂 **CSV import** to reload and re-analyze data
@@ -180,6 +181,9 @@ cd EdgePowerMeter
 
 # Install Python dependencies
 pip install PySide6 pyqtgraph pyserial reportlab matplotlib numpy
+
+# Optional: Install PyOpenGL for GPU-accelerated rendering
+pip install PyOpenGL PyOpenGL_accelerate
 
 # Run the application
 python run.py

@@ -36,6 +36,7 @@ dependencies = [
     "pyserial>=3.5",
     "reportlab>=4.0.0",
     "numpy>=1.20.0",
+    "scipy>=1.7.0",  # FFT spectrum analysis
     "matplotlib>=3.5.0",
     "PyOpenGL>=3.1.0",  # Hardware acceleration for smooth plotting
 ]

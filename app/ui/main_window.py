@@ -14,11 +14,12 @@ from typing import List, Optional, Deque
 
 from PySide6 import QtCore, QtWidgets, QtGui
 
-from app.serial.reader import SerialReader
-from app.version import __version__, APP_NAME
+from ..serial import SerialReader
+from ..core import AppSettings, Statistics, MeasurementRecord
+from ..export import ReportGenerator, CSVImporter
+from ..version import __version__, APP_NAME
 from .theme import ThemeColors, DARK_THEME, LIGHT_THEME, generate_stylesheet
-from .settings import SettingsDialog, AppSettings
-from .report import ReportGenerator, Statistics, MeasurementRecord, CSVImporter
+from .dialogs import SettingsDialog
 from .widgets import PlotBuffers, PlotWidget, StatCard, PortDiscovery
 
 
@@ -37,8 +38,10 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self._init_state()
         self._setup_ui()
+        self._apply_loaded_settings()
         self._connect_signals()
         self._setup_plot_throttle()
+        self._setup_port_monitor()
         self._refresh_ports()
     
     def _init_state(self) -> None:
@@ -46,8 +49,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.buffers = PlotBuffers()
         self.full_data: List[MeasurementRecord] = []
         self.report_generator = ReportGenerator()
-        self.settings = AppSettings()
-        self.theme = DARK_THEME
+        
+        # Load settings from persistent storage
+        self.settings = AppSettings.load()
+        self.theme = DARK_THEME if self.settings.dark_mode else LIGHT_THEME
         
         # Flag to track if we're actively acquiring
         self._acquiring = False
@@ -59,6 +64,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Running statistics for efficient avg power calculation
         self._power_sum: float = 0.0
         self._power_window: Deque[float] = deque(maxlen=1000)  # For moving average
+        
+        # Auto-reconnect state
+        self._last_port: Optional[str] = None
+        self._reconnect_timer: Optional[QtCore.QTimer] = None
     
     def _setup_ui(self) -> None:
         self.setWindowTitle(f"{APP_NAME} v{__version__}")
@@ -87,6 +96,20 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self._create_control_bar(main_layout)
         self._create_status_bar(main_layout)
+    
+    def _apply_loaded_settings(self) -> None:
+        """Apply all loaded settings to UI components after setup."""
+        s = self.settings
+        
+        # Plot widget settings
+        self.plot_widget.set_grid(s.show_grid, s.grid_alpha)
+        self.plot_widget.set_crosshair(s.show_crosshair)
+        
+        # Report generator
+        self.report_generator.include_fft = s.include_fft
+        
+        # Power window for moving average
+        self._power_window = deque(maxlen=s.moving_average_window)
     
     def _apply_theme(self) -> None:
         self.setStyleSheet(generate_stylesheet(self.theme))
@@ -224,7 +247,6 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.export_csv_btn)
         
         self.export_pdf_btn = QtWidgets.QPushButton("📊 PDF")
-        self.export_pdf_btn.setProperty("class", "primary")
         self.export_pdf_btn.setMinimumWidth(90)
         self.export_pdf_btn.setEnabled(False)
         layout.addWidget(self.export_pdf_btn)
@@ -248,6 +270,13 @@ class MainWindow(QtWidgets.QMainWindow):
         
         layout.addStretch()
         
+        # Cursor values display
+        self.cursor_label = QtWidgets.QLabel("")
+        self.cursor_label.setStyleSheet(f"color: {self.theme.text_secondary}; font-family: monospace;")
+        layout.addWidget(self.cursor_label)
+        
+        layout.addSpacing(20)
+        
         self.samples_label = QtWidgets.QLabel("Samples: 0")
         self.samples_label.setStyleSheet(f"color: {self.theme.text_secondary};")
         layout.addWidget(self.samples_label)
@@ -270,6 +299,93 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Connect plot view changes (pan, zoom) to trigger re-render
         self.plot_widget.view_changed.connect(self._request_plot_update)
+        
+        # Connect cursor values signal
+        self.plot_widget.cursor_values.connect(self._on_cursor_values)
+    
+    def _on_cursor_values(self, t: float, v: float, i: float, p: float) -> None:
+        """Update cursor values display."""
+        self.cursor_label.setText(
+            f"T: {t:.3f}s | V: {v:.4f}V | I: {i:.4f}A | P: {p:.4f}W"
+        )
+    
+    def _setup_port_monitor(self) -> None:
+        """Setup OS-level port change monitoring for auto-reconnect."""
+        import sys
+        if sys.platform == 'linux':
+            self._setup_linux_port_monitor()
+        else:
+            # Fallback: periodic check (less efficient but works everywhere)
+            self._port_check_timer = QtCore.QTimer()
+            self._port_check_timer.timeout.connect(self._check_port_availability)
+            self._port_check_timer.start(2000)  # Check every 2 seconds
+    
+    def _setup_linux_port_monitor(self) -> None:
+        """Use inotify to watch for USB device changes on Linux."""
+        try:
+            from PySide6.QtCore import QSocketNotifier
+            import os
+            
+            # Watch /dev for device changes
+            # We use a simpler approach: QFileSystemWatcher on /dev/serial/by-id
+            from PySide6.QtCore import QFileSystemWatcher
+            
+            self._port_watcher = QFileSystemWatcher()
+            
+            # Watch common serial device directories
+            watch_paths = ['/dev/serial/by-id', '/dev/serial/by-path', '/dev']
+            for path in watch_paths:
+                if os.path.exists(path):
+                    self._port_watcher.addPath(path)
+            
+            self._port_watcher.directoryChanged.connect(self._on_port_change)
+        except Exception:
+            # Fallback to timer-based checking
+            self._port_check_timer = QtCore.QTimer()
+            self._port_check_timer.timeout.connect(self._check_port_availability)
+            self._port_check_timer.start(2000)
+    
+    def _on_port_change(self, path: str) -> None:
+        """Called when serial port directory changes."""
+        # Refresh port list
+        self._refresh_ports()
+        
+        # Try to reconnect if we were disconnected and auto-reconnect is enabled
+        if (self.settings.auto_reconnect and 
+            self._last_port and 
+            not self._acquiring and
+            not self._is_connected()):
+            self._try_reconnect()
+    
+    def _check_port_availability(self) -> None:
+        """Periodic check for port changes (fallback for non-Linux)."""
+        if not self.settings.auto_reconnect:
+            return
+        
+        if self._last_port and not self._acquiring and not self._is_connected():
+            self._try_reconnect()
+    
+    def _try_reconnect(self) -> None:
+        """Attempt to reconnect to the last used port."""
+        if not self._last_port:
+            return
+        
+        # Check if port is available
+        from serial.tools import list_ports
+        available = [p.device for p in list_ports.comports()]
+        
+        if self._last_port in available:
+            self.status_label.setText(f"● Reconnecting to {self._last_port}...")
+            self.status_label.setStyleSheet(f"color: {self.theme.accent_warning};")
+            
+            # Set port in combo box
+            for i in range(self.port_combo.count()):
+                if self.port_combo.itemData(i) == self._last_port:
+                    self.port_combo.setCurrentIndex(i)
+                    break
+            
+            # Start acquisition
+            QtCore.QTimer.singleShot(500, self._start_acquisition)
     
     def _setup_plot_throttle(self) -> None:
         """Setup event-driven plot updates with rate limiting."""
@@ -340,6 +456,16 @@ class MainWindow(QtWidgets.QMainWindow):
         new_window = deque(self._power_window, maxlen=settings.moving_average_window)
         self._power_window = new_window
         
+        # Update plot widget settings
+        self.plot_widget.set_grid(settings.show_grid, settings.grid_alpha)
+        self.plot_widget.set_crosshair(settings.show_crosshair)
+        
+        # Update report generator FFT setting
+        self.report_generator.include_fft = settings.include_fft
+        
+        # Save settings to persistent storage
+        settings.save()
+        
         # Request plot update to apply any visual changes
         self._request_plot_update()
     
@@ -366,6 +492,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not port:
             QtWidgets.QMessageBox.warning(self, "Error", "Select a serial port first.")
             return
+        
+        # Save port for auto-reconnect
+        self._last_port = port
         
         # Make sure any previous reader is fully stopped
         if self.reader is not None:
@@ -397,6 +526,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         
+        # Disable PDF export during acquisition (CSV stays disabled from clear)
+        self.export_pdf_btn.setEnabled(False)
+        self.export_csv_btn.setEnabled(False)
+        self.select_all_btn.setEnabled(False)
+        
         self.status_label.setText(f"● Connected: {port}")
         self.status_label.setStyleSheet(f"color: {self.theme.accent_success};")
     
@@ -421,8 +555,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText("● Disconnected")
         self.status_label.setStyleSheet(f"color: {self.theme.text_muted};")
         
+        # Enable export after stopping if we have data
         if self.full_data:
-            self._enable_export()
+            # Small delay to ensure plot is updated before showing region selector
+            QtCore.QTimer.singleShot(100, self._enable_export)
     
     # -------------------------------------------------------------------------
     # Data Handling
@@ -438,13 +574,14 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Keep firmware timestamp for export
         ts = data['timestamp']
+        unix_time = ts.timestamp() if ts else time.time()
         
         v, i, p = data['voltage'], data['current'], data['power']
         
         # Use relative time for plotting
         self.buffers.append(rel_time, v, i, p)
         
-        self.full_data.append(MeasurementRecord(ts, rel_time, rel_time, v, i, p))
+        self.full_data.append(MeasurementRecord(ts, unix_time, rel_time, v, i, p))
         
         # Update running statistics
         self._power_sum += p
@@ -497,8 +634,17 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self.plot_widget.clear_data()
         self.select_all_btn.setEnabled(False)
+        
+        # Disable and remove colored classes (back to grey)
         self.export_csv_btn.setEnabled(False)
+        self.export_csv_btn.setProperty("class", "")
+        self.export_csv_btn.style().unpolish(self.export_csv_btn)
+        self.export_csv_btn.style().polish(self.export_csv_btn)
+        
         self.export_pdf_btn.setEnabled(False)
+        self.export_pdf_btn.setProperty("class", "")
+        self.export_pdf_btn.style().unpolish(self.export_pdf_btn)
+        self.export_pdf_btn.style().polish(self.export_pdf_btn)
         
         self.samples_label.setText("Samples: 0")
         self.voltage_card.set_value(0)
@@ -521,11 +667,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # Use relative time for region selector (starts from 0)
         t_min = self.full_data[0].relative_time
         t_max = self.full_data[-1].relative_time
+        
+        # Reset view to show all data before adding region selector
+        self.plot_widget.show_full_range(t_min, t_max)
         self.plot_widget.add_region_selector(t_min, t_max)
         
         self.select_all_btn.setEnabled(True)
+        
+        # Enable with colors: CSV green, PDF blue
         self.export_csv_btn.setEnabled(True)
+        self.export_csv_btn.setProperty("class", "success")
+        self.export_csv_btn.style().unpolish(self.export_csv_btn)
+        self.export_csv_btn.style().polish(self.export_csv_btn)
+        
         self.export_pdf_btn.setEnabled(True)
+        self.export_pdf_btn.setProperty("class", "primary")
+        self.export_pdf_btn.style().unpolish(self.export_pdf_btn)
+        self.export_pdf_btn.style().polish(self.export_pdf_btn)
     
     def _select_all(self) -> None:
         if not self.full_data:
@@ -591,9 +749,9 @@ class MainWindow(QtWidgets.QMainWindow):
             # Populate plot buffers
             for r in records:
                 self.buffers.append(r.unix_time, r.voltage, r.current, r.power)
-            
-            # Update UI
-            self._update_ui()
+
+            # Update plot
+            self._do_plot_update()
             self._enable_export()
             
             if records:

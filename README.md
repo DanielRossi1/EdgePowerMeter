@@ -58,11 +58,14 @@
 - 💾 CSV data export with full measurement history
 - 📂 **CSV import** to reload and re-analyze data
 - 📄 Professional PDF report with **graphs included**
+- 📉 **FFT spectrum analysis** for current signal (optional in PDF)
 - 🎨 Dark and Light theme support
-- ⚙️ Configurable serial port settings (921600 baud)
+- ⚙️ **Persistent settings** - preferences saved automatically
+- 🔌 **Auto-reconnect** with OS event-based port monitoring
 - 🔍 Zoom and pan on X-axis (Y-axis auto-scales)
-- 🖱️ **Middle-click** to reset auto-scroll
+- 🖱️ **Cursor values on hover** with crosshair
 - 📐 Selection region for detailed analysis
+- ⏱️ **Time-based scrolling window** (configurable)
 
 ---
 

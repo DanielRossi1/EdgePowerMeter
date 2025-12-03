@@ -1,8 +1,7 @@
-"""Theme and styling configuration for EdgePowerMeter UI."""
+"""Theme colors and definitions for EdgePowerMeter UI."""
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict
 
 
 @dataclass

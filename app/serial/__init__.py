@@ -1,5 +1,13 @@
-"""Serial subpackage for EdgePowerMeter app."""
+"""Serial communication package for EdgePowerMeter."""
 
-from .reader import SerialReader
+from .config import SerialConfig
+from .parser import MeasurementParser
+from .handler import SerialPortHandler
+from .serial_reader import SerialReader
 
-__all__ = ["SerialReader"]
+__all__ = [
+    "SerialConfig",
+    "MeasurementParser",
+    "SerialPortHandler",
+    "SerialReader",
+]

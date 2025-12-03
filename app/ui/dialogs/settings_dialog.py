@@ -1,8 +1,7 @@
 """Settings dialog for EdgePowerMeter."""
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Optional, Callable
+from typing import Optional
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QCheckBox,
@@ -11,35 +10,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal
 
-from .theme import ThemeColors, DARK_THEME, LIGHT_THEME, generate_stylesheet
-
-
-@dataclass
-class AppSettings:
-    """Application settings."""
-    # Theme
-    dark_mode: bool = True
-    
-    # Units
-    voltage_unit: str = "V"
-    current_unit: str = "A"
-    power_unit: str = "W"
-    
-    # Display
-    plot_points: int = 5000  # Max points to render in view
-    show_grid: bool = True
-    
-    # Average Power
-    use_moving_average: bool = True
-    moving_average_window: int = 100
-    
-    # Serial
-    baud_rate: int = 921600  # High-speed for ESP32-C3
-    auto_reconnect: bool = True
-    
-    # Export
-    csv_separator: str = ","
-    timestamp_format: str = "%Y-%m-%d %H:%M:%S.%f"
+from ...core import AppSettings
+from ..theme import ThemeColors
 
 
 class SettingsDialog(QDialog):
@@ -165,7 +137,8 @@ class SettingsDialog(QDialog):
     def _setup_ui(self) -> None:
         """Set up the dialog UI."""
         self.setWindowTitle("Settings")
-        self.setMinimumSize(450, 500)
+        self.setMinimumSize(550, 650)
+        self.resize(600, 700)
         self.setModal(True)
         
         layout = QVBoxLayout(self)
@@ -295,13 +268,28 @@ class SettingsDialog(QDialog):
         
         # Show grid
         self.show_grid_check = QCheckBox("Show grid lines")
-        grid.addWidget(self.show_grid_check, 1, 0, 1, 2)
+        self.show_grid_check.stateChanged.connect(self._on_grid_changed)
+        grid.addWidget(self.show_grid_check, 1, 0)
+        
+        # Grid opacity
+        grid.addWidget(QLabel("Grid opacity:"), 2, 0)
+        self.grid_alpha_spin = QDoubleSpinBox()
+        self.grid_alpha_spin.setRange(0.1, 1.0)
+        self.grid_alpha_spin.setSingleStep(0.1)
+        self.grid_alpha_spin.setDecimals(1)
+        self.grid_alpha_spin.setToolTip("Grid line opacity (0.1 - 1.0)")
+        grid.addWidget(self.grid_alpha_spin, 2, 1)
+        
+        # Crosshair (show values on hover)
+        self.show_crosshair_check = QCheckBox("Show cursor values on hover")
+        self.show_crosshair_check.setToolTip("Display V/I/P values when hovering over the graph")
+        grid.addWidget(self.show_crosshair_check, 3, 0, 1, 2)
         
         # Info label about event-driven updates
         info_label = QLabel("📊 Plot updates automatically when new data arrives (up to 60 FPS)")
         info_label.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
         info_label.setWordWrap(True)
-        grid.addWidget(info_label, 2, 0, 1, 2)
+        grid.addWidget(info_label, 4, 0, 1, 2)
         
         layout.addWidget(plot_group)
         
@@ -344,6 +332,11 @@ class SettingsDialog(QDialog):
         else:
             self.avg_info_label.setText("Average calculated over all recorded samples.")
     
+    def _on_grid_changed(self, state: int) -> None:
+        """Update UI when grid checkbox changes."""
+        enabled = state == Qt.Checked
+        self.grid_alpha_spin.setEnabled(enabled)
+    
     def _create_serial_tab(self) -> QWidget:
         """Create serial settings tab."""
         widget = QWidget()
@@ -363,11 +356,32 @@ class SettingsDialog(QDialog):
         
         # Auto reconnect
         self.auto_reconnect_check = QCheckBox("Auto-reconnect on disconnect")
+        self.auto_reconnect_check.setToolTip("Automatically reconnect if the serial port disconnects")
+        self.auto_reconnect_check.stateChanged.connect(self._on_reconnect_changed)
         grid.addWidget(self.auto_reconnect_check, 1, 0, 1, 2)
+        
+        # Reconnect interval
+        grid.addWidget(QLabel("Reconnect interval:"), 2, 0)
+        self.reconnect_interval_spin = QSpinBox()
+        self.reconnect_interval_spin.setRange(1, 30)
+        self.reconnect_interval_spin.setSuffix(" s")
+        self.reconnect_interval_spin.setToolTip("Seconds between reconnection attempts")
+        grid.addWidget(self.reconnect_interval_spin, 2, 1)
+        
+        # Info about reconnection
+        reconnect_info = QLabel("ℹ️ Uses OS events to detect port changes (efficient, no polling)")
+        reconnect_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        reconnect_info.setWordWrap(True)
+        grid.addWidget(reconnect_info, 3, 0, 1, 2)
         
         layout.addWidget(serial_group)
         layout.addStretch()
         return widget
+    
+    def _on_reconnect_changed(self, state: int) -> None:
+        """Update UI when auto-reconnect checkbox changes."""
+        enabled = state == Qt.Checked
+        self.reconnect_interval_spin.setEnabled(enabled)
     
     def _create_export_tab(self) -> QWidget:
         """Create export settings tab."""
@@ -398,12 +412,35 @@ class SettingsDialog(QDialog):
         grid.addWidget(self.timestamp_format_combo, 1, 1)
         
         layout.addWidget(csv_group)
+        
+        # PDF Analysis group
+        pdf_group = QGroupBox("PDF Report Analysis")
+        pdf_layout = QVBoxLayout(pdf_group)
+        pdf_layout.setSpacing(12)
+        
+        self.include_fft_check = QCheckBox("Include FFT spectrum analysis")
+        self.include_fft_check.setToolTip(
+            "Add frequency spectrum analysis of current signal to identify\n"
+            "switching noise, ripple, and periodic patterns"
+        )
+        pdf_layout.addWidget(self.include_fft_check)
+        
+        fft_info = QLabel(
+            "📊 FFT analysis shows frequency components in the current signal.\n"
+            "Useful for identifying: switching frequency, PWM ripple, 50/60Hz noise."
+        )
+        fft_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        fft_info.setWordWrap(True)
+        pdf_layout.addWidget(fft_info)
+        
+        layout.addWidget(pdf_group)
+        
         layout.addStretch()
         return widget
     
     def _create_about_tab(self) -> QWidget:
         """Create about/info tab with software information."""
-        from ..version import __version__, APP_NAME, AUTHOR, DESCRIPTION, URL, LICENSE
+        from ...version import __version__, APP_NAME, AUTHOR, DESCRIPTION, URL, LICENSE
         
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -523,6 +560,18 @@ class SettingsDialog(QDialog):
         idx = self.csv_separator_combo.findText(sep_text)
         if idx >= 0:
             self.csv_separator_combo.setCurrentIndex(idx)
+        
+        # Display - grid and crosshair
+        self.grid_alpha_spin.setValue(self.settings.grid_alpha)
+        self.grid_alpha_spin.setEnabled(self.settings.show_grid)
+        self.show_crosshair_check.setChecked(self.settings.show_crosshair)
+        
+        # Serial - reconnect interval
+        self.reconnect_interval_spin.setValue(self.settings.reconnect_interval)
+        self.reconnect_interval_spin.setEnabled(self.settings.auto_reconnect)
+        
+        # Export - FFT
+        self.include_fft_check.setChecked(self.settings.include_fft)
     
     def _apply_settings(self) -> None:
         """Apply settings and close dialog."""
@@ -539,6 +588,8 @@ class SettingsDialog(QDialog):
         # Display
         self.settings.plot_points = self.plot_points_spin.value()
         self.settings.show_grid = self.show_grid_check.isChecked()
+        self.settings.grid_alpha = self.grid_alpha_spin.value()
+        self.settings.show_crosshair = self.show_crosshair_check.isChecked()
         
         # Moving average
         self.settings.use_moving_average = self.moving_avg_check.isChecked()
@@ -547,12 +598,14 @@ class SettingsDialog(QDialog):
         # Serial
         self.settings.baud_rate = int(self.baud_rate_combo.currentText())
         self.settings.auto_reconnect = self.auto_reconnect_check.isChecked()
+        self.settings.reconnect_interval = self.reconnect_interval_spin.value()
         
         # Export
         sep_text = self.csv_separator_combo.currentText()
         sep_map = {", (comma)": ",", "; (semicolon)": ";", "\\t (tab)": "\t"}
         self.settings.csv_separator = sep_map.get(sep_text, ",")
         self.settings.timestamp_format = self.timestamp_format_combo.currentText()
+        self.settings.include_fft = self.include_fft_check.isChecked()
         
         # Emit signals
         self.settings_changed.emit(self.settings)

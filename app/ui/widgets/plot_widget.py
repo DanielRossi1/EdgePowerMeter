@@ -3,8 +3,11 @@
 from __future__ import annotations
 from typing import Optional, Tuple
 
+import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QLabel
+from PySide6.QtGui import QFont
 
 # Enable OpenGL acceleration for smooth 60+ FPS rendering
 _OPENGL_AVAILABLE = False
@@ -18,8 +21,6 @@ except ImportError:
 from ..theme import ThemeColors
 from .plot_buffers import PlotBuffers
 
-from PySide6.QtCore import Signal
-
 
 class PlotWidget(pg.GraphicsLayoutWidget):
     """Three-panel plot widget with sliding time window.
@@ -31,10 +32,14 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         - Auto-scroll when at live edge
         - Middle-click to reset to live view
         - All three plots synchronized
+        - Crosshair with value display on hover
     """
     
     # Signal emitted when view needs refresh (pan, zoom, resize)
     view_changed = Signal()
+    
+    # Signal emitted when cursor hovers over data (t, v, i, p)
+    cursor_values = Signal(float, float, float, float)
     
     # Time window settings
     DEFAULT_WINDOW_SECONDS = 10.0
@@ -53,8 +58,21 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self._last_data_time = 0.0
         self._updating = False
         
+        # Grid settings
+        self._show_grid = True
+        self._grid_alpha = 0.2
+        
+        # Crosshair settings
+        self._show_crosshair = True
+        self._crosshair_lines = []
+        self._current_data = (np.array([]), np.array([]), np.array([]), np.array([]))
+        
         self._setup_plots()
+        self._setup_crosshair()
         self.region: Optional[pg.LinearRegionItem] = None
+        
+        # Enable mouse tracking for crosshair
+        self.setMouseTracking(True)
     
     def _setup_plots(self) -> None:
         """Create the three plot panels."""
@@ -111,9 +129,65 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         # Connect to ViewBox signal for pan/zoom detection
         self.plot_v.getViewBox().sigRangeChanged.connect(self._on_view_changed)
     
+    def _setup_crosshair(self) -> None:
+        """Setup crosshair lines for value display on hover."""
+        # Vertical line that spans all plots (synced via X-link)
+        pen = pg.mkPen(color=self.theme.text_muted, width=1, style=Qt.DashLine)
+        
+        for plot in [self.plot_v, self.plot_i, self.plot_p]:
+            vline = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+            vline.setVisible(False)
+            plot.addItem(vline, ignoreBounds=True)
+            self._crosshair_lines.append(vline)
+        
+        # Connect mouse move signal from each plot
+        for plot in [self.plot_v, self.plot_i, self.plot_p]:
+            plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
+    
+    def _on_mouse_moved(self, pos) -> None:
+        """Handle mouse move for crosshair."""
+        if not self._show_crosshair:
+            return
+        
+        # Check if position is within any plot
+        for plot in [self.plot_v, self.plot_i, self.plot_p]:
+            if plot.sceneBoundingRect().contains(pos):
+                mouse_point = plot.getViewBox().mapSceneToView(pos)
+                x = mouse_point.x()
+                
+                # Show crosshair lines
+                for vline in self._crosshair_lines:
+                    vline.setPos(x)
+                    vline.setVisible(True)
+                
+                # Find nearest data point and emit values
+                self._emit_cursor_values(x)
+                return
+        
+        # Mouse outside plots - hide crosshair
+        for vline in self._crosshair_lines:
+            vline.setVisible(False)
+    
+    def _emit_cursor_values(self, x: float) -> None:
+        """Find and emit values at cursor position."""
+        xs, vs, cs, ps = self._current_data
+        if len(xs) == 0:
+            return
+        
+        # Find nearest index using binary search
+        idx = np.searchsorted(xs, x)
+        if idx >= len(xs):
+            idx = len(xs) - 1
+        elif idx > 0:
+            # Check which neighbor is closer
+            if abs(xs[idx-1] - x) < abs(xs[idx] - x):
+                idx = idx - 1
+        
+        self.cursor_values.emit(xs[idx], vs[idx], cs[idx], ps[idx])
+    
     def _style_plot(self, plot: pg.PlotItem, color: str) -> None:
         """Apply theme styling to a plot panel."""
-        plot.showGrid(x=True, y=True, alpha=0.2)
+        plot.showGrid(x=self._show_grid, y=self._show_grid, alpha=self._grid_alpha)
         plot.getAxis('left').setTextPen(self.theme.text_primary)
         plot.getAxis('left').setPen(self.theme.border_default)
         plot.getAxis('bottom').setTextPen(self.theme.text_primary)
@@ -146,6 +220,9 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         
         self._updating = True
         
+        # Store data for crosshair lookup
+        self._current_data = (xs, vs, cs, ps)
+        
         self._last_data_time = xs[-1]
         
         # If auto-scroll, update view range to follow live data
@@ -160,7 +237,6 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         t_end = view_range[1] + 0.5
         
         # Find visible slice
-        import numpy as np
         idx_start = max(0, np.searchsorted(xs, t_start) - 1)
         idx_end = min(len(xs), np.searchsorted(xs, t_end) + 1)
         
@@ -316,11 +392,48 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self._is_panning = True
         self.plot_v.setXRange(0, self._window_seconds, padding=0)
         self._is_panning = False
+        
+        # Clear crosshair data
+        self._current_data = (np.array([]), np.array([]), np.array([]), np.array([]))
     
     def reset_to_live(self) -> None:
         """Reset to live auto-scrolling view (same as middle-click)."""
         self._auto_scroll = True
         self._update_view_range()
+    
+    def show_full_range(self, t_min: float, t_max: float) -> None:
+        """Show the full time range (for export view).
+        
+        Disables auto-scroll and sets view to show all data.
+        """
+        self._auto_scroll = False
+        duration = t_max - t_min
+        self._window_seconds = max(duration, self.MIN_WINDOW_SECONDS)
+        
+        # Add small padding
+        padding = duration * 0.02 if duration > 0 else 0.5
+        
+        self._is_panning = True
+        self.plot_v.setXRange(t_min - padding, t_max + padding, padding=0)
+        self._is_panning = False
+    
+    # -------------------------------------------------------------------------
+    # Settings configuration
+    # -------------------------------------------------------------------------
+    
+    def set_grid(self, show: bool, alpha: float = 0.2) -> None:
+        """Configure grid visibility and opacity."""
+        self._show_grid = show
+        self._grid_alpha = alpha
+        for plot in [self.plot_v, self.plot_i, self.plot_p]:
+            plot.showGrid(x=show, y=show, alpha=alpha)
+    
+    def set_crosshair(self, show: bool) -> None:
+        """Enable/disable crosshair cursor."""
+        self._show_crosshair = show
+        if not show:
+            for vline in self._crosshair_lines:
+                vline.setVisible(False)
     
     @property
     def window_seconds(self) -> float:

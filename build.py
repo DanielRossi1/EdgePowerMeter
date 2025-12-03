@@ -58,12 +58,13 @@ def build_pyinstaller():
         "--hidden-import", "OpenGL.GL",
         "--hidden-import", "OpenGL.platform.glx",
         "--hidden-import", "OpenGL.platform.egl",
+        "--hidden-import", "scipy",
+        "--hidden-import", "scipy.fft",
         # Collect all matplotlib and PIL data files
         "--collect-all", "matplotlib",
         "--collect-all", "PIL",
         # Exclude unnecessary modules to reduce size
         "--exclude-module", "tkinter",
-        "--exclude-module", "scipy",
         "--exclude-module", "torch",
         "--exclude-module", "torchvision",
         "--exclude-module", "ultralytics",

@@ -20,7 +20,7 @@ BUILD_DIR = ROOT / "build"
 
 def clean():
     """Clean build artifacts."""
-    print("🧹 Cleaning build artifacts...")
+    print("[CLEAN] Cleaning build artifacts...")
     for d in [DIST_DIR, BUILD_DIR, ROOT / f"{APP_NAME}.spec"]:
         if isinstance(d, Path) and d.exists():
             if d.is_dir():
@@ -32,7 +32,7 @@ def clean():
 
 def build_pyinstaller():
     """Build executable using PyInstaller."""
-    print(f"📦 Building {APP_NAME} with PyInstaller...")
+    print(f"[BUILD] Building {APP_NAME} with PyInstaller...")
     
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -85,9 +85,9 @@ def build_pyinstaller():
     
     if exe_path.exists():
         size_mb = exe_path.stat().st_size / (1024 * 1024)
-        print(f"✅ Built: {exe_path} ({size_mb:.1f} MB)")
+        print(f"[OK] Built: {exe_path} ({size_mb:.1f} MB)")
     else:
-        print("❌ Build failed!")
+        print("[ERROR] Build failed!")
         sys.exit(1)
 
 
@@ -107,7 +107,7 @@ def get_architecture() -> str:
 
 def create_deb_structure():
     """Create .deb package structure."""
-    print(f"📦 Creating .deb package for {APP_NAME}...")
+    print(f"[BUILD] Creating .deb package for {APP_NAME}...")
     
     # Check if executable exists
     exe_path = DIST_DIR / APP_NAME
@@ -115,7 +115,7 @@ def create_deb_structure():
     if not exe_path.exists():
         exe_path = DIST_DIR / f"{APP_NAME}-arm64"
     if not exe_path.exists():
-        print("❌ Executable not found. Run build first!")
+        print("[ERROR] Executable not found. Run build first!")
         sys.exit(1)
     
     arch = get_architecture()
@@ -178,10 +178,10 @@ License: MIT
     
     if deb_file.exists():
         size_mb = deb_file.stat().st_size / (1024 * 1024)
-        print(f"✅ Built: {deb_file} ({size_mb:.1f} MB)")
-        print(f"   Install with: sudo dpkg -i {deb_file}")
+        print(f"[OK] Built: {deb_file} ({size_mb:.1f} MB)")
+        print(f"    Install with: sudo dpkg -i {deb_file}")
     else:
-        print("❌ .deb build failed!")
+        print("[ERROR] .deb build failed!")
         sys.exit(1)
 
 
@@ -204,7 +204,7 @@ def main():
         build_pyinstaller()
         if sys.platform == "linux":
             create_deb_structure()
-        print("\n🎉 Build complete!")
+        print("\n[DONE] Build complete!")
 
 
 if __name__ == "__main__":

@@ -56,10 +56,15 @@ parts:
       - libgl1
       - libegl1
       - libxkbcommon0
+      - libxkbcommon-x11-0
       - libxcb-cursor0
       - libxcb-icccm4
       - libxcb-keysyms1
       - libxcb-shape0
+      - libxcb-xinerama0
+      - libxcb-xinput0
+      - libxcb-xkb1
+      - libxcb-render-util0
     override-build: |
       craftctl default
       # Create launcher script

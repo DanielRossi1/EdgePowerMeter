@@ -1,0 +1,79 @@
+name: edgepowermeter
+version: '1.5.0'
+title: EdgePowerMeter
+summary: Real-time power analyser for embedded AI workloads
+description: |
+  EdgePowerMeter is a complete power monitoring solution designed to measure 
+  voltage, current, and power consumption of embedded devices running AI 
+  inference workloads. Perfect for benchmarking FPS-per-Watt efficiency.
+
+  Features:
+  - Real-time voltage, current, and power graphs
+  - OpenGL accelerated rendering for smooth 60+ FPS
+  - CSV data export with full measurement history
+  - Professional PDF reports with graphs
+  - Dark and Light theme support
+  - Works with INA226-based power monitors
+
+license: Apache-2.0
+website: https://github.com/DanielRossi1/EdgePowerMeter
+source-code: https://github.com/DanielRossi1/EdgePowerMeter
+issues: https://github.com/DanielRossi1/EdgePowerMeter/issues
+
+base: core22
+grade: stable
+confinement: strict
+
+architectures:
+  - build-on: amd64
+  - build-on: arm64
+
+apps:
+  edgepowermeter:
+    command: bin/edgepowermeter
+    desktop: share/applications/edgepowermeter.desktop
+    extensions: [gnome]
+    plugs:
+      - home
+      - network
+      - serial-port
+      - raw-usb
+      - hardware-observe
+
+parts:
+  edgepowermeter:
+    plugin: python
+    source: .
+    python-packages:
+      - PySide6>=6.4.0
+      - pyqtgraph>=0.13.0
+      - pyserial>=3.5
+      - reportlab>=4.0.0
+      - numpy>=1.20.0
+      - matplotlib>=3.5.0
+      - PyOpenGL>=3.1.0
+    stage-packages:
+      - libgl1
+      - libegl1
+      - libxkbcommon0
+      - libxcb-cursor0
+      - libxcb-icccm4
+      - libxcb-keysyms1
+      - libxcb-shape0
+    override-build: |
+      craftctl default
+      # Create launcher script
+      mkdir -p $SNAPCRAFT_PART_INSTALL/bin
+      cat > $SNAPCRAFT_PART_INSTALL/bin/edgepowermeter << 'EOF'
+      #!/bin/bash
+      cd $SNAP
+      exec $SNAP/bin/python3 -m app.main "$@"
+      EOF
+      chmod +x $SNAPCRAFT_PART_INSTALL/bin/edgepowermeter
+
+  desktop-file:
+    plugin: dump
+    source: snap/local
+    organize:
+      edgepowermeter.desktop: share/applications/edgepowermeter.desktop
+      edgepowermeter.png: share/icons/hicolor/256x256/apps/edgepowermeter.png

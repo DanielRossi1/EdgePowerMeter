@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=EdgePowerMeter
+Comment=Real-time power monitoring for embedded AI workloads
+Exec=edgepowermeter
+Icon=${SNAP}/share/icons/hicolor/256x256/apps/edgepowermeter.png
+Terminal=false
+Type=Application
+Categories=Development;Electronics;Engineering;
+Keywords=power;monitor;voltage;current;embedded;ina226;

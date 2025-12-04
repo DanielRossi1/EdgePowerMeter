@@ -161,3 +161,10 @@ Desktop.ini
 *.elf
 *.hex
 *.bin
+
+# Snapcraft
+*.snap
+parts/
+prime/
+stage/
+snap/.snapcraft/

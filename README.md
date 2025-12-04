@@ -158,10 +158,19 @@ Download the latest release for your platform from the [Releases](https://github
 
 | Platform | File |
 |----------|------|
+| Linux (Snap Store) | `sudo snap install edgepowermeter` |
 | Linux (Debian/Ubuntu) | `edgepowermeter_x.x.x_amd64.deb` |
 | Linux (Other) | `EdgePowerMeter` (standalone) |
 | Windows | `EdgePowerMeter.exe` |
-| macOS | `EdgePowerMeter.app` |
+| macOS (Intel) | `EdgePowerMeter-macos-x86_64.zip` |
+| macOS (Apple Silicon) | `EdgePowerMeter-macos-arm64.zip` |
+
+#### Linux (Snap Store) - Recommended
+```bash
+sudo snap install edgepowermeter
+sudo snap connect edgepowermeter:raw-usb  # Required for USB serial access
+edgepowermeter
+```
 
 #### Linux (.deb)
 ```bash

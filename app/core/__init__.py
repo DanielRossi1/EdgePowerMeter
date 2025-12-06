@@ -3,10 +3,24 @@
 from .measurement import Measurement, MeasurementRecord
 from .statistics import Statistics
 from .settings import AppSettings
+from .harmonic_analysis import (
+    HarmonicAnalysis,
+    HarmonicAnalyzer,
+    HarmonicComponent,
+)
+from .power_supply_quality import (
+    PowerSupplyQuality,
+    PowerSupplyAnalyzer,
+)
 
 __all__ = [
     'Measurement',
     'MeasurementRecord', 
     'Statistics',
     'AppSettings',
+    'HarmonicAnalysis',
+    'HarmonicAnalyzer',
+    'HarmonicComponent',
+    'PowerSupplyQuality',
+    'PowerSupplyAnalyzer',
 ]

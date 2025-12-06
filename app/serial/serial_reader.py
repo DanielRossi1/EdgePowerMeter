@@ -13,6 +13,7 @@ from PySide6 import QtCore
 from .config import SerialConfig
 from .handler import SerialPortHandler
 from .parser import MeasurementParser
+from .sampler import SampleRateController
 
 
 class SerialReader(QtCore.QThread):
@@ -26,10 +27,12 @@ class SerialReader(QtCore.QThread):
     data_received = QtCore.Signal(object)
     error = QtCore.Signal(str)
 
-    def __init__(self, port: str, baud: int = SerialConfig.DEFAULT_BAUD, parent=None):
+    def __init__(self, port: str, baud: int = SerialConfig.DEFAULT_BAUD, 
+                 target_sample_rate: int = 0, parent=None):
         super().__init__(parent)
         self._port_handler = SerialPortHandler(port, baud)
         self._parser = MeasurementParser()
+        self._sampler = SampleRateController(target_sample_rate, max_device_rate=100)
         self._running = False
 
     @property
@@ -57,7 +60,9 @@ class SerialReader(QtCore.QThread):
                 measurement = self._parser.parse_line(line)
                 
                 if measurement:
-                    self.data_received.emit(measurement.to_dict())
+                    # Check if we should accept this sample (subsampling control)
+                    if self._sampler.should_accept_sample():
+                        self.data_received.emit(measurement.to_dict())
                     
             except (TypeError, OSError, IOError) as e:
                 if not self._running:

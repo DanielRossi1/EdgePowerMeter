@@ -31,12 +31,19 @@ class AppSettings:
     auto_reconnect: bool = True
     reconnect_interval: int = 2  # Seconds between reconnect attempts
     
+    # Sampling
+    target_sample_rate: int = 0  # Target sampling rate in Hz (0 = maximum/no limit)
+    max_device_sample_rate: int = 100  # Maximum rate the device can provide
+    
     # Export
     csv_separator: str = ","
     timestamp_format: str = "%Y-%m-%d %H:%M:%S.%f"
     
     # Analysis
     include_fft: bool = False  # Include FFT analysis in PDF report
+    include_harmonic_analysis: bool = False  # Include THD and harmonic spectrum in PDF
+    harmonic_max_order: int = 10  # Maximum harmonic order to analyze (1-20)
+    harmonic_signal: str = "current"  # Signal to analyze: "current", "voltage", or "power"
     
     def save(self) -> None:
         """Save settings to persistent storage.

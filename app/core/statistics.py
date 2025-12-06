@@ -39,17 +39,20 @@ class Statistics:
         currents = [r.current for r in records]
         powers = [r.power for r in records]
         
-        duration = records[-1].unix_time - records[0].unix_time
+        # Use relative_time for accurate duration
+        duration = records[-1].relative_time - records[0].relative_time
         if duration <= 0:
-            duration = len(records) * 0.1
+            duration = len(records) * 0.01  # Assume ~100Hz sampling
         
         # Calculate energy and charge using trapezoidal integration
+        # Use absolute values to handle sensor offset (negative readings at zero load)
         energy_ws = 0.0
         charge_as = 0.0
         for i in range(1, len(records)):
-            dt = records[i].unix_time - records[i-1].unix_time
-            avg_power = (records[i].power + records[i-1].power) / 2
-            avg_current = (records[i].current + records[i-1].current) / 2
+            dt = records[i].relative_time - records[i-1].relative_time
+            # Use max(0, power) to ignore negative power from sensor offset
+            avg_power = max(0, (records[i].power + records[i-1].power) / 2)
+            avg_current = max(0, (records[i].current + records[i-1].current) / 2)
             energy_ws += avg_power * dt
             charge_as += avg_current * dt
         

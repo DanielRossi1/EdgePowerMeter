@@ -31,10 +31,22 @@ class PortDiscovery:
             List of tuples (device_name, display_label)
         """
         result = []
-        for port in list_ports.comports():
-            if show_all or cls._is_usb_device(port):
-                desc = port.description or port.hwid or 'Unknown'
-                result.append((port.device, f"{port.device} — {desc}"))
+        try:
+            ports = list_ports.comports()
+        except (TypeError, ValueError, OSError) as e:
+            # Handle pyserial issues in sandboxed environments (snap/flatpak)
+            print(f"[WARNING] Error listing serial ports: {e}")
+            return result
+        
+        for port in ports:
+            try:
+                if show_all or cls._is_usb_device(port):
+                    desc = port.description or port.hwid or 'Unknown'
+                    result.append((port.device, f"{port.device} — {desc}"))
+            except (TypeError, ValueError, AttributeError) as e:
+                # Skip ports that cause errors during enumeration
+                print(f"[WARNING] Error processing port {getattr(port, 'device', 'unknown')}: {e}")
+                continue
         return result
     
     @classmethod

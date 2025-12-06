@@ -121,6 +121,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Report generator
         self.report_generator.include_fft = s.include_fft
+        self.report_generator.include_harmonic_analysis = s.include_harmonic_analysis
+        self.report_generator.harmonic_max_order = s.harmonic_max_order
+        self.report_generator.harmonic_signal = s.harmonic_signal
         
         # Power window for moving average
         self._power_window = deque(maxlen=s.moving_average_window)
@@ -211,6 +214,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self.avg_power_card = StatCard("AVG POWER", "W", self.theme.accent_primary)
         layout.addWidget(self.avg_power_card)
+        
+        self.sample_rate_card = StatCard("SAMPLE RATE", "Hz", self.theme.text_secondary)
+        layout.addWidget(self.sample_rate_card)
         
         layout.addSpacing(10)
         
@@ -476,6 +482,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Update report generator FFT setting
         self.report_generator.include_fft = settings.include_fft
+        self.report_generator.include_harmonic_analysis = settings.include_harmonic_analysis
+        self.report_generator.harmonic_max_order = settings.harmonic_max_order
+        self.report_generator.harmonic_signal = settings.harmonic_signal
         
         # Save settings to persistent storage
         settings.save()
@@ -528,7 +537,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QThread.msleep(200)
         
         # Create and start new reader
-        self.reader = SerialReader(port, baud=self.settings.baud_rate)
+        self.reader = SerialReader(port, baud=self.settings.baud_rate, 
+                                    target_sample_rate=self.settings.target_sample_rate)
         self.reader.data_received.connect(self._on_data, QtCore.Qt.QueuedConnection)
         self.reader.error.connect(self._on_error, QtCore.Qt.QueuedConnection)
         self.reader.start()
@@ -619,6 +629,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_card.set_value(i)
         self.power_card.set_value(p)
         self.avg_power_card.set_value(self._calculate_avg_power())
+        
+        # Calculate and display sample rate
+        if len(self.full_data) >= 2:
+            # Use last 50 samples for accurate rate calculation
+            recent_samples = min(50, len(self.full_data))
+            time_diff = self.full_data[-1].relative_time - self.full_data[-recent_samples].relative_time
+            if time_diff > 0:
+                sample_rate = (recent_samples - 1) / time_diff
+                self.sample_rate_card.set_value(sample_rate)
     
     def _calculate_avg_power(self) -> float:
         """Calculate average power efficiently using running statistics."""
@@ -723,8 +742,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sel_power_label.setText("Avg Power: --")
             return
         
-        # Use absolute difference to handle any ordering issues
-        duration = abs(records[-1].unix_time - records[0].unix_time)
+        # Use relative_time for accurate duration (unix_time can have sync issues)
+        duration = records[-1].relative_time - records[0].relative_time
         avg_power = sum(r.power for r in records) / len(records)
         
         self.sel_samples_label.setText(f"Samples: {len(records):,}")

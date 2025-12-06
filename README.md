@@ -58,7 +58,9 @@
 - 💾 CSV data export with full measurement history
 - 📂 **CSV import** to reload and re-analyze data
 - 📄 Professional PDF report with **graphs included**
-- 📉 **FFT spectrum analysis** for current signal (optional in PDF)
+- 📉 **FFT spectrum analysis** optimized for DC systems with dynamic loads
+- ⚡ **Power supply quality analysis** - voltage ripple, load regulation, settling time
+- 🎯 **Sampling rate control** - configurable subsampling from device rate
 - 🎨 Dark and Light theme support
 - ⚙️ **Persistent settings** - preferences saved automatically
 - 🔌 **Auto-reconnect** with OS event-based port monitoring
@@ -99,10 +101,12 @@ Each measurement type shows:
 ![Derived Metrics](assets/prototype/statistics/derived.png)
 
 Advanced calculations including:
-- Sampling rate (Hz)
-- Voltage/Current ripple
-- Power factor estimation
-- Load impedance estimation
+- **Sampling rate** (Hz) - real-time display with configurable subsampling
+- **Voltage/Current ripple** - percentage and absolute values
+- **Power supply quality** - ripple, load regulation, settling time, stability rating
+- **Spectrum analysis** - dominant frequencies in load variations
+- **Power factor estimation** - for AC/DC systems
+- **Load impedance estimation** - dynamic resistance calculation
 
 ### Data Export
 
@@ -192,7 +196,7 @@ git clone https://github.com/DanielRossi1/EdgePowerMeter.git
 cd EdgePowerMeter
 
 # Install Python dependencies
-pip install PySide6 pyqtgraph pyserial reportlab matplotlib numpy
+pip install PySide6 pyqtgraph pyserial reportlab matplotlib numpy scipy
 
 # Optional: Install PyOpenGL for GPU-accelerated rendering
 pip install PyOpenGL PyOpenGL_accelerate

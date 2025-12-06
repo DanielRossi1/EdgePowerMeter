@@ -23,21 +23,36 @@ The application follows a modular architecture with clear separation of concerns
 app/
 ├── main.py              # Application entry point
 ├── version.py           # Version information
+├── core/                # Core analysis modules
+│   ├── __init__.py
+│   ├── harmonic_analysis.py        # FFT spectrum analysis for DC systems
+│   ├── power_supply_quality.py    # PSU quality metrics (ripple, regulation)
+│   ├── measurement.py              # Measurement dataclass
+│   ├── settings.py                 # Settings dataclass
+│   └── statistics.py               # Statistics calculations
 ├── serial/
 │   ├── __init__.py
-│   └── reader.py        # Serial communication layer (921600 baud)
+│   ├── serial_reader.py            # Serial communication (921600 baud)
+│   ├── sampler.py                  # Sample rate controller
+│   ├── parser.py                   # Data parsing
+│   └── handler.py                  # Serial port handling
+├── export/
+│   ├── __init__.py
+│   ├── csv_importer.py             # CSV import/export
+│   └── pdf_report.py               # PDF generation with graphs
 └── ui/
     ├── __init__.py
-    ├── main_window.py   # Main GUI window
-    ├── theme.py         # Theme definitions
-    ├── settings.py      # Settings management
-    ├── report.py        # Export functionality (CSV/PDF with graphs)
-    └── widgets/         # Reusable UI components
+    ├── main_window.py              # Main GUI window
+    ├── dialogs/
+    │   └── settings_dialog.py      # Settings UI
+    ├── theme/
+    │   └── colors.py               # Theme definitions
+    └── widgets/                    # Reusable UI components
         ├── __init__.py
-        ├── plot_buffers.py   # Data buffering for plots
-        ├── plot_widget.py    # Three-panel graph widget
-        ├── stat_card.py      # Statistics display card
-        └── port_discovery.py # Serial port detection
+        ├── plot_buffers.py         # Data buffering for plots
+        ├── plot_widget.py          # Three-panel graph widget
+        ├── stat_card.py            # Statistics display card
+        └── port_discovery.py       # Serial port detection
 ```
 
 ### Design Principles
@@ -92,6 +107,130 @@ def on_measurement(m: Measurement):
 config = SerialConfig(port="/dev/ttyUSB0")
 reader = SerialReader(config, callback=on_measurement)
 reader.start()
+```
+
+---
+
+### `app/core/harmonic_analysis.py`
+
+Provides FFT spectrum analysis optimized for DC systems with dynamic loads.
+
+#### Classes
+
+**`FrequencyComponent`** (dataclass)
+```python
+@dataclass
+class FrequencyComponent:
+    frequency: float  # Hz
+    magnitude: float  # Amplitude
+    phase: float      # Radians
+    percentage: float # % of DC component
+```
+
+**`HarmonicAnalysis`** (dataclass)
+```python
+@dataclass
+class HarmonicAnalysis:
+    dominant_frequency: float
+    modulation_depth: float  # For DC systems (replaces THD)
+    frequency_components: List[FrequencyComponent]
+    sample_rate: float
+    duration: float
+```
+
+**`HarmonicAnalyzer`**
+- `analyze_signal()`: Performs FFT on current signal
+- `analyze_spectrum()`: General spectrum analysis for DC systems
+- Removes AC-specific constraints (40-70 Hz range)
+- Finds dominant frequencies in load variations
+- Calculates modulation depth for DC systems
+
+#### Usage Example
+
+```python
+from app.core import HarmonicAnalyzer
+
+analyzer = HarmonicAnalyzer()
+result = analyzer.analyze_signal(measurements)
+
+if result:
+    print(f"Dominant frequency: {result.dominant_frequency:.3f} Hz")
+    print(f"Modulation depth: {result.modulation_depth:.2f}%")
+```
+
+---
+
+### `app/core/power_supply_quality.py`
+
+Analyzes power supply quality metrics for DC systems.
+
+#### Classes
+
+**`PowerSupplyQuality`** (dataclass)
+```python
+@dataclass
+class PowerSupplyQuality:
+    voltage_ripple_percent: float
+    voltage_ripple_mv: float
+    load_regulation_percent: float
+    settling_time_ms: float
+    rms_noise_mv: float
+    stability_rating: str  # "Excellent", "Good", "Fair", "Poor"
+```
+
+**`PowerSupplyAnalyzer`**
+- `analyze_voltage_quality()`: Calculates ripple, RMS noise
+- `_analyze_load_regulation()`: Measures voltage stability under load
+- `get_quality_recommendations()`: Provides actionable feedback
+
+Quality thresholds:
+- **Excellent**: <0.05% ripple
+- **Good**: <0.1% ripple
+- **Fair**: <1% ripple
+- **Poor**: >1% ripple
+
+#### Usage Example
+
+```python
+from app.core import PowerSupplyAnalyzer
+
+analyzer = PowerSupplyAnalyzer()
+quality = analyzer.analyze_voltage_quality(measurements)
+
+print(f"Ripple: {quality.voltage_ripple_percent:.3f}%")
+print(f"Stability: {quality.stability_rating}")
+```
+
+---
+
+### `app/serial/sampler.py`
+
+Provides sampling rate control with time-based subsampling.
+
+#### Classes
+
+**`SampleRateController`**
+- `should_accept_sample()`: Time-based subsampling logic
+- `get_actual_rate()`: Returns achieved sample rate
+- `update_target()`: Runtime target rate adjustment
+- `reset()`: Resets timing state
+
+When `target_sample_rate` is:
+- **0**: Maximum device rate (no subsampling)
+- **< device max**: Subsamples to target rate
+- **> device max**: Uses device maximum
+
+#### Usage Example
+
+```python
+from app.serial import SampleRateController
+
+controller = SampleRateController(target_rate=10, max_rate=100)
+
+if controller.should_accept_sample():
+    process_sample(data)
+
+print(f"Actual rate: {controller.get_actual_rate():.1f} Hz")
 ```
 
 ---

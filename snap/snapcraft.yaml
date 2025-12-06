@@ -1,5 +1,5 @@
 name: edgepowermeter
-version: '1.5.0'
+version: '1.6.0'
 title: EdgePowerMeter
 summary: Real-time power analyser for embedded AI workloads
 description: |
@@ -50,6 +50,7 @@ parts:
       - pyserial>=3.5
       - reportlab>=4.0.0
       - numpy>=1.20.0
+      - scipy>=1.7.0
       - matplotlib>=3.5.0
       - PyOpenGL>=3.1.0
     stage-packages:

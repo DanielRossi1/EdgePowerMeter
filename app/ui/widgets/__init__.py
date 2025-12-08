@@ -12,5 +12,6 @@ from .stat_card import StatCard
 from .plot_widget import PlotWidget
 from .plot_buffers import PlotBuffers
 from .port_discovery import PortDiscovery
+from .cpu_bar import CPUBar
 
-__all__ = ['StatCard', 'PlotWidget', 'PlotBuffers', 'PortDiscovery']
+__all__ = ['StatCard', 'PlotWidget', 'PlotBuffers', 'PortDiscovery', 'CPUBar']

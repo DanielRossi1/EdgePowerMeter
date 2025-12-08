@@ -319,6 +319,22 @@ class SettingsDialog(QDialog):
         avg_layout.addWidget(self.avg_info_label, 2, 0, 1, 2)
         
         layout.addWidget(avg_group)
+
+        # System monitor group
+        sys_group = QGroupBox("System Monitor")
+        sys_layout = QVBoxLayout(sys_group)
+        sys_layout.setSpacing(8)
+
+        self.show_cpu_usage_check = QCheckBox("Show CPU usage in status bar")
+        self.show_cpu_usage_check.setToolTip("Display a live CPU usage bar near the connection status")
+        sys_layout.addWidget(self.show_cpu_usage_check)
+
+        sys_info = QLabel("ℹ️ Optional. Uses /proc/stat or psutil if available. Updates ~1 Hz.")
+        sys_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        sys_info.setWordWrap(True)
+        sys_layout.addWidget(sys_info)
+
+        layout.addWidget(sys_group)
         
         layout.addStretch()
         return widget
@@ -375,6 +391,36 @@ class SettingsDialog(QDialog):
         grid.addWidget(reconnect_info, 3, 0, 1, 2)
         
         layout.addWidget(serial_group)
+        
+        # Sampling group
+        sampling_group = QGroupBox("Sampling Rate Control")
+        sample_grid = QGridLayout(sampling_group)
+        sample_grid.setSpacing(12)
+        
+        # Target sample rate
+        sample_grid.addWidget(QLabel("Target sample rate:"), 0, 0)
+        self.target_sample_rate_spin = QSpinBox()
+        self.target_sample_rate_spin.setRange(0, 1000)
+        self.target_sample_rate_spin.setSuffix(" Hz")
+        self.target_sample_rate_spin.setSpecialValueText("Maximum (no limit)")
+        self.target_sample_rate_spin.setToolTip(
+            "Target sampling rate in Hz.\n"
+            "• 0 = Maximum device rate (no subsampling)\n"
+            "• < Device max = Subsample to this rate\n"
+            "• > Device max = Use maximum device rate"
+        )
+        sample_grid.addWidget(self.target_sample_rate_spin, 0, 1)
+        
+        # Device max info
+        sample_info = QLabel(
+            "ℹ️ Device maximum: ~360 Hz (ESP32+C3 @1MHz I²C, INA226)\n"
+            "Set to 0 for maximum throughput, or lower to reduce data volume"
+        )
+        sample_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        sample_info.setWordWrap(True)
+        sample_grid.addWidget(sample_info, 1, 0, 1, 2)
+        
+        layout.addWidget(sampling_group)
         layout.addStretch()
         return widget
     
@@ -418,6 +464,7 @@ class SettingsDialog(QDialog):
         pdf_layout = QVBoxLayout(pdf_group)
         pdf_layout.setSpacing(12)
         
+        # FFT Analysis
         self.include_fft_check = QCheckBox("Include FFT spectrum analysis")
         self.include_fft_check.setToolTip(
             "Add frequency spectrum analysis of current signal to identify\n"
@@ -432,6 +479,50 @@ class SettingsDialog(QDialog):
         fft_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
         fft_info.setWordWrap(True)
         pdf_layout.addWidget(fft_info)
+        
+        # Harmonic Analysis
+        pdf_layout.addSpacing(8)
+        self.include_harmonic_check = QCheckBox("Include harmonic analysis (THD + spectrum)")
+        self.include_harmonic_check.setToolTip(
+            "Add Total Harmonic Distortion analysis and individual harmonic components.\n"
+            "Essential for power quality assessment and compliance testing."
+        )
+        pdf_layout.addWidget(self.include_harmonic_check)
+        
+        # Harmonic settings sub-group
+        harmonic_settings = QWidget()
+        harmonic_grid = QGridLayout(harmonic_settings)
+        harmonic_grid.setContentsMargins(20, 0, 0, 0)
+        
+        harmonic_grid.addWidget(QLabel("Signal to analyze:"), 0, 0)
+        self.harmonic_signal_combo = QComboBox()
+        self.harmonic_signal_combo.addItems(["Current", "Voltage", "Power"])
+        self.harmonic_signal_combo.setToolTip("Select which signal to analyze for harmonics")
+        harmonic_grid.addWidget(self.harmonic_signal_combo, 0, 1)
+        
+        harmonic_grid.addWidget(QLabel("Max harmonic order:"), 1, 0)
+        self.harmonic_max_order_spin = QSpinBox()
+        self.harmonic_max_order_spin.setRange(3, 20)
+        self.harmonic_max_order_spin.setValue(10)
+        self.harmonic_max_order_spin.setToolTip("Maximum harmonic order to analyze (1=fundamental)")
+        harmonic_grid.addWidget(self.harmonic_max_order_spin, 1, 1)
+        
+        pdf_layout.addWidget(harmonic_settings)
+        
+        # Enable/disable harmonic settings based on checkbox
+        def toggle_harmonic_settings(checked: bool):
+            harmonic_settings.setEnabled(checked)
+        self.include_harmonic_check.toggled.connect(toggle_harmonic_settings)
+        harmonic_settings.setEnabled(False)
+        
+        harmonic_info = QLabel(
+            "🔬 Harmonic analysis calculates THD%, individual harmonics (2nd-Nth),\n"
+            "and checks compliance with IEC 61000-3-2 limits.\n"
+            "Useful for: power supplies, inverters, motor drives, non-linear loads."
+        )
+        harmonic_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        harmonic_info.setWordWrap(True)
+        pdf_layout.addWidget(harmonic_info)
         
         layout.addWidget(pdf_group)
         
@@ -541,6 +632,7 @@ class SettingsDialog(QDialog):
         # Display
         self.plot_points_spin.setValue(self.settings.plot_points)
         self.show_grid_check.setChecked(self.settings.show_grid)
+        self.show_cpu_usage_check.setChecked(self.settings.show_cpu_usage)
         
         # Moving average
         self.moving_avg_check.setChecked(self.settings.use_moving_average)
@@ -553,6 +645,10 @@ class SettingsDialog(QDialog):
         if idx >= 0:
             self.baud_rate_combo.setCurrentIndex(idx)
         self.auto_reconnect_check.setChecked(self.settings.auto_reconnect)
+        self.reconnect_interval_spin.setValue(self.settings.reconnect_interval)
+        
+        # Sampling
+        self.target_sample_rate_spin.setValue(self.settings.target_sample_rate)
         
         # Export - map separator back to display text
         sep_map = {",": ", (comma)", ";": "; (semicolon)", "\t": "\\t (tab)"}
@@ -572,6 +668,15 @@ class SettingsDialog(QDialog):
         
         # Export - FFT
         self.include_fft_check.setChecked(self.settings.include_fft)
+        
+        # Export - Harmonic Analysis
+        self.include_harmonic_check.setChecked(self.settings.include_harmonic_analysis)
+        self.harmonic_max_order_spin.setValue(self.settings.harmonic_max_order)
+        
+        # Map signal type to combo index
+        signal_map = {"current": 0, "voltage": 1, "power": 2}
+        signal_idx = signal_map.get(self.settings.harmonic_signal.lower(), 0)
+        self.harmonic_signal_combo.setCurrentIndex(signal_idx)
     
     def _apply_settings(self) -> None:
         """Apply settings and close dialog."""
@@ -590,6 +695,7 @@ class SettingsDialog(QDialog):
         self.settings.show_grid = self.show_grid_check.isChecked()
         self.settings.grid_alpha = self.grid_alpha_spin.value()
         self.settings.show_crosshair = self.show_crosshair_check.isChecked()
+        self.settings.show_cpu_usage = self.show_cpu_usage_check.isChecked()
         
         # Moving average
         self.settings.use_moving_average = self.moving_avg_check.isChecked()
@@ -600,12 +706,23 @@ class SettingsDialog(QDialog):
         self.settings.auto_reconnect = self.auto_reconnect_check.isChecked()
         self.settings.reconnect_interval = self.reconnect_interval_spin.value()
         
+        # Sampling
+        self.settings.target_sample_rate = self.target_sample_rate_spin.value()
+        
         # Export
         sep_text = self.csv_separator_combo.currentText()
         sep_map = {", (comma)": ",", "; (semicolon)": ";", "\\t (tab)": "\t"}
         self.settings.csv_separator = sep_map.get(sep_text, ",")
         self.settings.timestamp_format = self.timestamp_format_combo.currentText()
         self.settings.include_fft = self.include_fft_check.isChecked()
+        
+        # Harmonic Analysis
+        self.settings.include_harmonic_analysis = self.include_harmonic_check.isChecked()
+        self.settings.harmonic_max_order = self.harmonic_max_order_spin.value()
+        
+        # Map combo index to signal type
+        signal_types = ["current", "voltage", "power"]
+        self.settings.harmonic_signal = signal_types[self.harmonic_signal_combo.currentIndex()]
         
         # Emit signals
         self.settings_changed.emit(self.settings)

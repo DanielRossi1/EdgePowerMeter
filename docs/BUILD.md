@@ -129,7 +129,7 @@ Example Inno Setup script (`installer.iss`):
 ```iss
 [Setup]
 AppName=EdgePowerMeter
-AppVersion=1.0.0
+AppVersion=1.6.0
 DefaultDirName={autopf}\EdgePowerMeter
 DefaultGroupName=EdgePowerMeter
 OutputDir=dist
@@ -202,7 +202,7 @@ Edit `build.py` to modify:
 
 ```python
 APP_NAME = "EdgePowerMeter"    # Application name
-VERSION = "1.0.0"               # Version number
+VERSION = "1.6.0"               # Version number
 DESCRIPTION = "..."             # Package description
 AUTHOR = "Daniel Rossi"         # Author name
 ```

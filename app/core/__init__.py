@@ -12,6 +12,7 @@ from .power_supply_quality import (
     PowerSupplyQuality,
     PowerSupplyAnalyzer,
 )
+from .cpu_monitor import CPUUsageMonitor
 
 __all__ = [
     'Measurement',
@@ -23,4 +24,5 @@ __all__ = [
     'HarmonicComponent',
     'PowerSupplyQuality',
     'PowerSupplyAnalyzer',
+    'CPUUsageMonitor',
 ]

@@ -27,13 +27,16 @@ class AppSettings:
     moving_average_window: int = 100
     
     # Serial
-    baud_rate: int = 921600  # High-speed for ESP32-C3
+    baud_rate: int = 2000000  # High-speed for ESP32-C3
     auto_reconnect: bool = True
     reconnect_interval: int = 2  # Seconds between reconnect attempts
     
     # Sampling
     target_sample_rate: int = 0  # Target sampling rate in Hz (0 = maximum/no limit)
-    max_device_sample_rate: int = 100  # Maximum rate the device can provide
+    max_device_sample_rate: int = 400  # Maximum rate the device can provide
+
+    # System Monitor
+    show_cpu_usage: bool = False  # Show CPU usage indicator in status bar
     
     # Export
     csv_separator: str = ","

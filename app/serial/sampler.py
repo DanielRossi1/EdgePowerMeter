@@ -11,26 +11,29 @@ from typing import Optional
 class SampleRateController:
     """Controls sampling rate with subsampling support."""
     
-    def __init__(self, target_rate: int = 0, max_device_rate: int = 100):
+    def __init__(self, target_rate: int = 0, max_device_rate: int = 400):
         """Initialize sample rate controller.
         
         Args:
             target_rate: Target sampling rate in Hz (0 = no limit)
             max_device_rate: Maximum rate the device can provide
         """
-        self.target_rate = target_rate
         self.max_device_rate = max_device_rate
         self._last_sample_time: Optional[float] = None
         self._sample_count = 0
         self._start_time: Optional[float] = None
+
+        # Rate matching state using time-based accumulator (robust to jitter)
+        # Each arrival adds (elapsed * target_rate) tokens; consume 1 per accepted sample.
+        self._accumulator = 0.0
+        self._last_arrival: Optional[float] = None
         
-        # Calculate if subsampling is needed
+        # Calculated target values (driven by requested target when subsampling)
+        self._effective_target = 0.0
         self._needs_subsampling = False
         self._min_interval = 0.0
-        
-        if target_rate > 0 and target_rate < max_device_rate:
-            self._needs_subsampling = True
-            self._min_interval = 1.0 / target_rate
+
+        self._set_target(target_rate)
     
     def should_accept_sample(self) -> bool:
         """Check if current sample should be accepted.
@@ -41,22 +44,29 @@ class SampleRateController:
         if not self._needs_subsampling:
             return True  # Accept all samples
         
-        current_time = time.perf_counter()
-        
-        if self._last_sample_time is None:
-            self._last_sample_time = current_time
-            if self._start_time is None:
-                self._start_time = current_time
-            self._sample_count += 1
+        now = time.perf_counter()
+
+        if self._last_arrival is None:
+            # First arrival: accept to establish timing
+            self._last_arrival = now
+            self._record_accept(now)
             return True
-        
-        # Check if enough time has passed
-        elapsed = current_time - self._last_sample_time
-        if elapsed >= self._min_interval:
-            self._last_sample_time = current_time
-            self._sample_count += 1
+
+        interval = now - self._last_arrival
+        self._last_arrival = now
+
+        # Accumulate tokens proportional to elapsed time and target rate
+        # Keep a soft cap to avoid huge bursts after long stalls, but allow
+        # fractional carry to preserve accuracy (cap at 10 tokens).
+        self._accumulator += interval * self._effective_target
+        if self._accumulator > 10.0:
+            self._accumulator = 10.0
+
+        if self._accumulator >= 1.0:
+            self._accumulator -= 1.0
+            self._record_accept(now)
             return True
-        
+
         return False
     
     def get_actual_rate(self) -> float:
@@ -78,6 +88,8 @@ class SampleRateController:
         self._last_sample_time = None
         self._sample_count = 0
         self._start_time = None
+        self._accumulator = 0.0
+        self._last_arrival = None
     
     def update_target(self, target_rate: int) -> None:
         """Update target sampling rate.
@@ -85,17 +97,32 @@ class SampleRateController:
         Args:
             target_rate: New target rate in Hz (0 = no limit)
         """
+        self._set_target(target_rate)
+        self.reset()
+
+    def _set_target(self, target_rate: int) -> None:
+        """Clamp and store target parameters."""
         self.target_rate = target_rate
-        
-        # Recalculate subsampling parameters
-        if target_rate > 0 and target_rate < self.max_device_rate:
-            self._needs_subsampling = True
-            self._min_interval = 1.0 / target_rate
-        else:
+
+        # Simple contract:
+        # - 0 => no limit (accept all)
+        # - target > 0 => subsample to that target rate
+        if target_rate <= 0:
+            self._effective_target = 0.0
             self._needs_subsampling = False
             self._min_interval = 0.0
-        
-        self.reset()
+            return
+
+        self._effective_target = float(target_rate)
+        self._needs_subsampling = True
+        self._min_interval = 1.0 / self._effective_target
+
+    def _record_accept(self, now: float) -> None:
+        """Update bookkeeping when a sample is accepted."""
+        self._last_sample_time = now
+        self._sample_count += 1
+        if self._start_time is None:
+            self._start_time = now
     
     @property
     def is_subsampling(self) -> bool:
@@ -109,6 +136,6 @@ class SampleRateController:
         Returns:
             Effective rate in Hz
         """
-        if self.target_rate == 0:
+        if not self._needs_subsampling:
             return self.max_device_rate
-        return min(self.target_rate, self.max_device_rate)
+        return int(self._effective_target)

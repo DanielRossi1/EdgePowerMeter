@@ -319,6 +319,22 @@ class SettingsDialog(QDialog):
         avg_layout.addWidget(self.avg_info_label, 2, 0, 1, 2)
         
         layout.addWidget(avg_group)
+
+        # System monitor group
+        sys_group = QGroupBox("System Monitor")
+        sys_layout = QVBoxLayout(sys_group)
+        sys_layout.setSpacing(8)
+
+        self.show_cpu_usage_check = QCheckBox("Show CPU usage in status bar")
+        self.show_cpu_usage_check.setToolTip("Display a live CPU usage bar near the connection status")
+        sys_layout.addWidget(self.show_cpu_usage_check)
+
+        sys_info = QLabel("ℹ️ Optional. Uses /proc/stat or psutil if available. Updates ~1 Hz.")
+        sys_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        sys_info.setWordWrap(True)
+        sys_layout.addWidget(sys_info)
+
+        layout.addWidget(sys_group)
         
         layout.addStretch()
         return widget
@@ -397,7 +413,7 @@ class SettingsDialog(QDialog):
         
         # Device max info
         sample_info = QLabel(
-            "ℹ️ Device maximum: ~100 Hz (ESP32 with INA226)\n"
+            "ℹ️ Device maximum: ~360 Hz (ESP32+C3 @1MHz I²C, INA226)\n"
             "Set to 0 for maximum throughput, or lower to reduce data volume"
         )
         sample_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
@@ -616,6 +632,7 @@ class SettingsDialog(QDialog):
         # Display
         self.plot_points_spin.setValue(self.settings.plot_points)
         self.show_grid_check.setChecked(self.settings.show_grid)
+        self.show_cpu_usage_check.setChecked(self.settings.show_cpu_usage)
         
         # Moving average
         self.moving_avg_check.setChecked(self.settings.use_moving_average)
@@ -678,6 +695,7 @@ class SettingsDialog(QDialog):
         self.settings.show_grid = self.show_grid_check.isChecked()
         self.settings.grid_alpha = self.grid_alpha_spin.value()
         self.settings.show_crosshair = self.show_crosshair_check.isChecked()
+        self.settings.show_cpu_usage = self.show_cpu_usage_check.isChecked()
         
         # Moving average
         self.settings.use_moving_average = self.moving_avg_check.isChecked()

@@ -1,7 +1,7 @@
 /**
  * @file EdgePowerMeter.ino
  * @brief Real-time power monitoring firmware for embedded AI workload analysis
- * @version 1.3.0
+ * @version 1.6.0
  * 
  * This firmware reads voltage, current, and power measurements from an INA226
  * power monitor and outputs CSV-formatted data via serial for logging and analysis.
@@ -49,7 +49,7 @@
 // Version
 // =============================================================================
 
-#define FIRMWARE_VERSION "1.3.0"
+#define FIRMWARE_VERSION "1.6.0"
 #define FIRMWARE_NAME "EdgePowerMeter"
 
 // =============================================================================
@@ -76,13 +76,13 @@ namespace Config {
     // Timing intervals (milliseconds)
     // MEASUREMENT_INTERVAL_MS: how often to read the INA226 sensor
     // OUTPUT_INTERVAL_MS: how often to send data via serial (set to same as measurement for max speed)
-    constexpr unsigned long MEASUREMENT_INTERVAL_MS = 10;   // 100 Hz measurement
-    constexpr unsigned long OUTPUT_INTERVAL_MS = 10;        // 100 Hz output (was 100ms = 10Hz)
+    constexpr unsigned long MEASUREMENT_INTERVAL_MS = 1;   // 1 kHz request (actual limited by INA226 conversion)
+    constexpr unsigned long OUTPUT_INTERVAL_MS = 1;        // 1 kHz request (actual limited by INA226 conversion)
     constexpr unsigned long DISPLAY_INTERVAL_MS = 100;      // 10 Hz display update (OLED is slow)
     
     // Serial settings
     // 921600 baud for faster data transfer (ESP32-C3 USB-CDC supports high speeds)
-    constexpr unsigned long SERIAL_BAUD = 921600;
+    constexpr unsigned long SERIAL_BAUD = 2000000;
     
     // RTC settings
     // Set to true to force RTC update on every upload (useful for initial setup)
@@ -134,9 +134,12 @@ namespace PowerMonitor {
             Config::CURRENT_ZERO_OFFSET_MA,
             Config::BUS_VOLTAGE_SCALING
         );
+        powerMonitor.setBusVoltageConversionTime(INA226_140_us);
+        powerMonitor.setShuntVoltageConversionTime(INA226_140_us);
+        
+        powerMonitor.setAverage(INA226_4_SAMPLES);
         
         powerMonitor.setModeShuntBusContinuous();
-        powerMonitor.setAverage(INA226_16_SAMPLES);
         
         Serial.println(F("[INFO] INA226 initialized successfully"));
         return true;
@@ -218,6 +221,7 @@ void setup() {
     Serial.println(F("[INFO] Initializing..."));
     
     Wire.begin();
+    Wire.setClock(1000000);  // Increase I2C speed to 1 MHz (fast mode plus on ESP32-C3)
     
     // Initialize display (using OLEDStatus library)
     if (!display.begin(Config::SCREEN_ADDRESS)) {

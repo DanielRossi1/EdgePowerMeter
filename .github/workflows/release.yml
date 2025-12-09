@@ -105,7 +105,7 @@ jobs:
           path: dist/EdgePowerMeter.exe
 
   build-macos-intel:
-    runs-on: macos-13  # Intel Mac
+    runs-on:  macos-15-intel # Intel Mac
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

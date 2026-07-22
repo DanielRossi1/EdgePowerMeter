@@ -61,6 +61,9 @@ class ReportGenerator:
             leftMargin=20*mm,
             topMargin=20*mm,
             bottomMargin=20*mm,
+            title=f"{APP_NAME} Report",
+            author=APP_NAME,
+            subject="Power measurement report",
         )
         
         styles = getSampleStyleSheet()
@@ -142,12 +145,6 @@ class ReportGenerator:
             ('TOPPADDING', (0, 0), (-1, -1), 8),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
         ]))
-        story.append(KeepTogether([
-            Paragraph("Summary Statistics", section_style),
-            summary_table,
-            Spacer(1, 20),
-        ]))
-        
         # Energy Analysis - keep title and table together
         energy_data = [
             ["Metric", "Value", "Unit"],
@@ -172,13 +169,7 @@ class ReportGenerator:
             ('TOPPADDING', (0, 0), (-1, -1), 8),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
         ]))
-        story.append(KeepTogether([
-            Paragraph("Energy Analysis", section_style),
-            energy_table,
-            Spacer(1, 20),
-        ]))
-        
-        # Derived Metrics - keep title and table together
+        # Derived Metrics
         sampling_rate = stats.count / stats.duration_seconds if stats.duration_seconds > 0 else 0
         power_factor = stats.power_avg / (stats.voltage_avg * stats.current_avg) if (stats.voltage_avg * stats.current_avg) > 0 else 0
         impedance = stats.voltage_avg / stats.current_avg if stats.current_avg > 0 else 0
@@ -205,11 +196,22 @@ class ReportGenerator:
             ('TOPPADDING', (0, 0), (-1, -1), 6),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
         ]))
+        # Summary/Energy/Derived kept as a single unit: on its own each table
+        # is small enough to tempt SimpleDocTemplate into stranding it alone
+        # on a fresh page (half the previous page and most of the next left
+        # blank). Grouping them means that decision is made once, for all
+        # three together, instead of three times.
         story.append(KeepTogether([
+            Paragraph("Summary Statistics", section_style),
+            summary_table,
+            Spacer(1, 20),
+            Paragraph("Energy Analysis", section_style),
+            energy_table,
+            Spacer(1, 20),
             Paragraph("Derived Metrics", section_style),
             derived_table,
         ]))
-        
+
         # Generate graphs
         story.append(PageBreak())
         story.append(Paragraph("Measurement Graphs", section_style))
@@ -249,6 +251,7 @@ class ReportGenerator:
             
             # Perform frequency spectrum analysis
             signal_name = self.harmonic_signal.capitalize()
+            signal_unit = {"voltage": "V", "current": "A", "power": "W"}.get(self.harmonic_signal, "")
             analyzer = HarmonicAnalyzer(max_harmonics=self.harmonic_max_order)
             harmonic_result = analyzer.analyze_signal(records, self.harmonic_signal, max_display_freq=25.0)
             
@@ -270,7 +273,7 @@ class ReportGenerator:
                 thd_data = [
                     ["Metric", "Value"],
                     ["Dominant Frequency", f"{harmonic_result.fundamental_freq:.2f} Hz"],
-                    ["Dominant Amplitude", f"{harmonic_result.fundamental_amplitude:.4f} {signal_name[0]}"],
+                    ["Dominant Amplitude", f"{harmonic_result.fundamental_amplitude:.4f} {signal_unit}"],
                     ["Modulation Depth", f"{harmonic_result.thd_percent:.2f}%"],
                 ]
                 
@@ -473,9 +476,12 @@ class ReportGenerator:
         currents = [r.current for r in records]
         powers = [r.power for r in records]
         
-        # Graph settings
-        fig_width = 170 * mm / 25.4  # Convert mm to inches
-        fig_height = 70 * mm / 25.4  # Slightly taller for better readability
+        # Graph settings (mm -> inches for matplotlib figsize; must NOT also
+        # multiply by reportlab's `mm` unit, which is already points-per-mm
+        # and is only meant for point-based layout sizes like the Image() call
+        # below - combining both inflated every chart to ~2.83x too large)
+        fig_width = 170 / 25.4  # Convert mm to inches
+        fig_height = 70 / 25.4  # Slightly taller for better readability
         
         images = []
         
@@ -601,9 +607,9 @@ class ReportGenerator:
         magnitude[magnitude < 1e-10] = 1e-10
         magnitude_db = 20 * np.log10(magnitude / np.max(magnitude))
         
-        # Create figure
-        fig_width = 170 * mm / 25.4
-        fig_height = 90 * mm / 25.4
+        # Create figure (mm -> inches; see note in _generate_graphs)
+        fig_width = 170 / 25.4
+        fig_height = 90 / 25.4
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(fig_width, fig_height))
         fig.patch.set_facecolor('white')
@@ -855,16 +861,7 @@ class ReportGenerator:
             plt.close(fig)
             
             return Image(buf, width=180*mm, height=180*mm)
-            
-            # Save to buffer
-            buf = BytesIO()
-            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight',
-                       facecolor='white', edgecolor='none')
-            buf.seek(0)
-            plt.close(fig)
-            
-            return Image(buf, width=170*mm, height=130*mm)
-        
+
         except Exception as e:
             print(f"[WARNING] Failed to generate harmonic graph: {e}")
             return None

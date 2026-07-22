@@ -345,7 +345,11 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Connect cursor values signal
         self.plot_widget.cursor_values.connect(self._on_cursor_values)
-    
+
+        # Keep selection stats (samples/duration/avg power) live while the
+        # user drags the export region selector.
+        self.plot_widget.region_changed.connect(self._update_selection_stats)
+
     def _on_cursor_values(self, t: float, v: float, i: float, p: float) -> None:
         """Update cursor values display."""
         self.cursor_label.setText(
@@ -576,6 +580,8 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self.reader.data_received.disconnect(self._on_data)
                 self.reader.error.disconnect(self._on_error)
+                self.reader.data_stale.disconnect(self._on_data_stale)
+                self.reader.data_resumed.disconnect(self._on_data_resumed)
             except RuntimeError:
                 pass
             self.reader.stop(self.STOP_TIMEOUT_MS)
@@ -597,6 +603,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.reader.data_received.connect(self._on_data, QtCore.Qt.QueuedConnection)
         self.reader.error.connect(self._on_error, QtCore.Qt.QueuedConnection)
+        self.reader.data_stale.connect(self._on_data_stale, QtCore.Qt.QueuedConnection)
+        self.reader.data_resumed.connect(self._on_data_resumed, QtCore.Qt.QueuedConnection)
         self.reader.start()
         
         # Now we're acquiring - record start time
@@ -623,6 +631,8 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self.reader.data_received.disconnect(self._on_data)
                 self.reader.error.disconnect(self._on_error)
+                self.reader.data_stale.disconnect(self._on_data_stale)
+                self.reader.data_resumed.disconnect(self._on_data_resumed)
             except RuntimeError:
                 pass  # Already disconnected
             
@@ -712,6 +722,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_error(self, msg: str) -> None:
         QtWidgets.QMessageBox.critical(self, "Serial Error", msg)
         self._stop_acquisition()
+
+    def _on_data_stale(self, elapsed: float) -> None:
+        """Device still connected but has sent no valid measurement for a while."""
+        if not self._acquiring:
+            return
+        self.status_label.setText(f"⚠ Nessun dato da {elapsed:.0f}s...")
+        self.status_label.setStyleSheet(f"color: {self.theme.accent_warning};")
+
+    def _on_data_resumed(self) -> None:
+        """Data flow resumed after a stale warning."""
+        if not self._acquiring or not self.reader:
+            return
+        self.status_label.setText(f"● Connected: {self.reader.port}")
+        self.status_label.setStyleSheet(f"color: {self.theme.accent_success};")
     
     def _clear_data(self) -> None:
         self.buffers.clear()
@@ -834,19 +858,26 @@ class MainWindow(QtWidgets.QMainWindow):
             # Clear existing data and load imported
             self._clear_data()
             self.full_data = records
-            
-            # Populate plot buffers
+
+            # Populate plot buffers using relative time (consistent with live
+            # acquisition and immune to millisecond-collision point dropping).
             for r in records:
-                self.buffers.append(r.unix_time, r.voltage, r.current, r.power)
+                self.buffers.append(r.relative_time, r.voltage, r.current, r.power)
+
+            # Rebuild running power statistics so AVG POWER is correct after import
+            self._power_sum = sum(r.power for r in records)
+            self._power_window.clear()
+            self._power_window.extend(r.power for r in records)
 
             # Update plot
             self._do_plot_update()
             self._enable_export()
-            
+
             if records:
                 self.voltage_card.set_value(records[-1].voltage)
                 self.current_card.set_value(records[-1].current)
                 self.power_card.set_value(records[-1].power)
+                self.avg_power_card.set_value(self._calculate_avg_power())
             
             self.samples_label.setText(f"Samples: {len(records):,}")
             self.status_label.setText(f"● Imported: {Path(path).name}")

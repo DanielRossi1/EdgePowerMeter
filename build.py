@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build script for EdgePowerMeter - creates executables for different platforms."""
 
+import os
 import subprocess
 import sys
 import shutil
@@ -218,25 +219,109 @@ License: MIT
         sys.exit(1)
 
 
+def create_appimage():
+    """Create an AppImage package (Linux only).
+
+    Requires `appimagetool` on PATH, or its location in the APPIMAGETOOL
+    env var (get it from https://github.com/AppImage/AppImageKit/releases).
+    """
+    print(f"[BUILD] Creating AppImage for {APP_NAME}...")
+
+    exe_path = DIST_DIR / APP_NAME
+    if not exe_path.exists():
+        exe_path = DIST_DIR / f"{APP_NAME}-arm64"
+    if not exe_path.exists():
+        print("[ERROR] Executable not found. Run build first!")
+        sys.exit(1)
+
+    arch = get_architecture()
+    arch_tag = {"amd64": "x86_64", "arm64": "aarch64"}.get(arch, arch)
+
+    appdir = DIST_DIR / "AppDir"
+    if appdir.exists():
+        shutil.rmtree(appdir)
+    (appdir / "usr" / "bin").mkdir(parents=True, exist_ok=True)
+    (appdir / "usr" / "share" / "applications").mkdir(parents=True, exist_ok=True)
+    (appdir / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps").mkdir(parents=True, exist_ok=True)
+
+    # Executable
+    shutil.copy(exe_path, appdir / "usr" / "bin" / APP_NAME)
+    (appdir / "usr" / "bin" / APP_NAME).chmod(0o755)
+
+    # Icon (top-level copy is required by AppImage/appimagetool conventions)
+    icon_png = ROOT / "assets" / "icons" / "EdgePowerMeter.png"
+    if icon_png.exists():
+        shutil.copy(icon_png, appdir / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps" / f"{APP_NAME.lower()}.png")
+        shutil.copy(icon_png, appdir / f"{APP_NAME.lower()}.png")
+
+    # Desktop entry (top-level copy required alongside the AppDir one)
+    desktop_content = f"""[Desktop Entry]
+Name={APP_NAME}
+Comment={DESCRIPTION}
+Exec={APP_NAME}
+Icon={APP_NAME.lower()}
+Terminal=false
+Type=Application
+Categories=Utility;Electronics;
+Keywords=power;meter;monitoring;serial;
+"""
+    (appdir / "usr" / "share" / "applications" / f"{APP_NAME.lower()}.desktop").write_text(desktop_content)
+    (appdir / f"{APP_NAME.lower()}.desktop").write_text(desktop_content)
+
+    # Entry point script
+    apprun = appdir / "AppRun"
+    apprun.write_text(f"""#!/bin/bash
+HERE="$(dirname "$(readlink -f "${{0}}")")"
+exec "$HERE/usr/bin/{APP_NAME}" "$@"
+""")
+    apprun.chmod(0o755)
+
+    appimagetool = os.environ.get("APPIMAGETOOL") or shutil.which("appimagetool")
+    if not appimagetool:
+        print("[ERROR] appimagetool not found (set APPIMAGETOOL or put it on PATH).")
+        print("        Get it from https://github.com/AppImage/AppImageKit/releases")
+        sys.exit(1)
+
+    appimage_file = DIST_DIR / f"{APP_NAME}-{arch_tag}.AppImage"
+    env = dict(os.environ, ARCH=arch_tag)
+    # --appimage-extract-and-run: GitHub-hosted runners have no FUSE, so
+    # appimagetool can't mount itself the normal way.
+    subprocess.run(
+        [appimagetool, "--appimage-extract-and-run", str(appdir), str(appimage_file)],
+        check=True, env=env,
+    )
+
+    if appimage_file.exists():
+        size_mb = appimage_file.stat().st_size / (1024 * 1024)
+        print(f"[OK] Built: {appimage_file} ({size_mb:.1f} MB)")
+    else:
+        print("[ERROR] AppImage build failed!")
+        sys.exit(1)
+
+
 def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Build EdgePowerMeter")
-    parser.add_argument("command", choices=["clean", "exe", "deb", "all"],
+    parser.add_argument("command", choices=["clean", "exe", "deb", "appimage", "all"],
                        help="Build command")
     args = parser.parse_args()
-    
+
     if args.command == "clean":
         clean()
     elif args.command == "exe":
         build_pyinstaller()
     elif args.command == "deb":
         create_deb_structure()
+    elif args.command == "appimage":
+        create_appimage()
     elif args.command == "all":
         clean()
         build_pyinstaller()
         if sys.platform == "linux":
             create_deb_structure()
+            if os.environ.get("APPIMAGETOOL") or shutil.which("appimagetool"):
+                create_appimage()
         print("\n[DONE] Build complete!")
 
 

@@ -79,7 +79,12 @@ class PowerSupplyAnalyzer:
         # Calculate ripple (peak-to-peak variation)
         voltage_ripple_v = v_max - v_min
         voltage_ripple_mv = voltage_ripple_v * 1000.0
-        voltage_ripple_percent = (voltage_ripple_v / nominal_voltage) * 100.0
+        # Guard against a ~0 V rail (no source connected): a relative ripple is
+        # undefined there, so report 0% instead of producing inf/NaN.
+        if abs(nominal_voltage) < 1e-9:
+            voltage_ripple_percent = 0.0
+        else:
+            voltage_ripple_percent = (voltage_ripple_v / abs(nominal_voltage)) * 100.0
         
         # Calculate RMS noise (variation from mean)
         rms_noise = np.sqrt(np.mean((voltages - v_mean) ** 2))
@@ -170,7 +175,10 @@ class PowerSupplyAnalyzer:
         
         # Calculate load regulation
         voltage_change = abs(v_after - v_before)
-        load_regulation_percent = (voltage_change / nominal_voltage) * 100.0
+        if abs(nominal_voltage) < 1e-9:
+            load_regulation_percent = 0.0
+        else:
+            load_regulation_percent = (voltage_change / abs(nominal_voltage)) * 100.0
         
         # Calculate settling time
         times = np.array([r.relative_time for r in records])

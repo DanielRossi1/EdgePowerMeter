@@ -3,7 +3,7 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 import csv
 
 from ..core import MeasurementRecord
@@ -127,26 +127,30 @@ class CSVImporter:
                     "Timestamp, Voltage, Current, Power"
                 )
             
-            # Detect if file has RelativeTime column (5 columns)
+            # Detect if file has RelativeTime column (5 columns).
+            # The RelativeTime column carries microsecond-accurate timing that the
+            # millisecond-truncated timestamp cannot, so we preserve it when present.
             has_relative_time_col = len(header) >= 5 and 'relative' in header[1].lower()
-            
+
             # Parse data rows
             line_num = 1
-            start_time: float = 0.0
-            
+            start_unix: Optional[float] = None
+
             for row in reader:
                 line_num += 1
-                
+
                 if len(row) < 4:
                     continue  # Skip incomplete rows
-                
+
                 try:
                     # Clean values (remove units if present)
                     ts_str = row[0].strip()
-                    
+                    relative_time: Optional[float] = None
+
                     # Handle both old format (4 cols) and new format (5 cols with RelativeTime)
                     if has_relative_time_col and len(row) >= 5:
                         # New format: Timestamp, RelativeTime, Voltage, Current, Power
+                        relative_time = float(row[1].strip().replace(',', '.'))
                         voltage = float(row[2].strip().replace(',', '.'))
                         current = float(row[3].strip().replace(',', '.'))
                         power = float(row[4].strip().replace(',', '.'))
@@ -155,18 +159,20 @@ class CSVImporter:
                         voltage = float(row[1].strip().replace(',', '.'))
                         current = float(row[2].strip().replace(',', '.'))
                         power = float(row[3].strip().replace(',', '.'))
-                    
+
                     timestamp = cls.parse_timestamp(ts_str)
                     unix_time = timestamp.timestamp()
-                    
+
                     # Track start time for relative time calculation
-                    if start_time == 0.0:
-                        start_time = unix_time
-                    
+                    if start_unix is None:
+                        start_unix = unix_time
+
                     records.append(MeasurementRecord(
                         timestamp=timestamp,
                         unix_time=unix_time,
-                        relative_time=unix_time - start_time,
+                        # Fall back to timestamp-derived time only when column is absent
+                        relative_time=relative_time if relative_time is not None
+                        else unix_time - start_unix,
                         voltage=voltage,
                         current=current,
                         power=power
@@ -174,18 +180,23 @@ class CSVImporter:
                 except (ValueError, IndexError):
                     # Skip invalid rows but continue processing
                     continue
-        
+
         if not records:
             raise ValueError("No valid data rows found in CSV file")
-        
-        # Sort by timestamp to ensure correct order
-        records.sort(key=lambda r: r.unix_time)
-        
-        # Recalculate relative times after sorting
-        if records:
-            start_time = records[0].unix_time
+
+        if has_relative_time_col:
+            # Trust the precise RelativeTime column: sort by it and rebase to 0.
+            records.sort(key=lambda r: r.relative_time)
+            offset = records[0].relative_time
+            if offset != 0.0:
+                for r in records:
+                    object.__setattr__(r, 'relative_time', r.relative_time - offset)
+        else:
+            # Reconstruct relative time from (lower-precision) absolute timestamps.
+            records.sort(key=lambda r: r.unix_time)
+            start_unix = records[0].unix_time
             for r in records:
                 # Use object.__setattr__ since dataclass might be frozen
-                object.__setattr__(r, 'relative_time', r.unix_time - start_time)
-        
+                object.__setattr__(r, 'relative_time', r.unix_time - start_unix)
+
         return records

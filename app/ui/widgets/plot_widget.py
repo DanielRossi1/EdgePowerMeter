@@ -37,9 +37,12 @@ class PlotWidget(pg.GraphicsLayoutWidget):
     
     # Signal emitted when view needs refresh (pan, zoom, resize)
     view_changed = Signal()
-    
+
     # Signal emitted when cursor hovers over data (t, v, i, p)
     cursor_values = Signal(float, float, float, float)
+
+    # Signal emitted while the export region selector is dragged
+    region_changed = Signal()
     
     # Time window settings
     DEFAULT_WINDOW_SECONDS = 10.0
@@ -282,16 +285,30 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         if self._auto_scroll:
             self._update_view_range()
         else:
-            # Zoom around center of current view
+            # Zoom around the point under the cursor (falls back to the view
+            # center if the cursor isn't over a plot), matching the zoom
+            # behavior users expect from other charting/mapping tools instead
+            # of always re-centering on the current view's midpoint.
             current_range = self.plot_v.viewRange()[0]
-            center = (current_range[0] + current_range[1]) / 2
-            t_start = center - self._window_seconds / 2
-            t_end = center + self._window_seconds / 2
-            
+            old_span = current_range[1] - current_range[0]
+            anchor = (current_range[0] + current_range[1]) / 2
+            frac = 0.5
+
+            scene_pos = self.mapToScene(event.position().toPoint())
+            for plot in (self.plot_v, self.plot_i, self.plot_p):
+                if plot.sceneBoundingRect().contains(scene_pos):
+                    anchor = plot.getViewBox().mapSceneToView(scene_pos).x()
+                    if old_span > 0:
+                        frac = (anchor - current_range[0]) / old_span
+                    break
+
+            t_start = anchor - frac * self._window_seconds
+            t_end = t_start + self._window_seconds
+
             self._is_panning = True
             self.plot_v.setXRange(t_start, t_end, padding=0)
             self._is_panning = False
-        
+
         event.accept()
     
     def mousePressEvent(self, event) -> None:
@@ -330,6 +347,10 @@ class PlotWidget(pg.GraphicsLayoutWidget):
             pen=pg.mkPen(self.theme.accent_primary, width=2),
         )
         self.region.setZValue(10)
+        # Live feedback while dragging: selection stats (samples/duration/avg
+        # power) in the sidebar should track the handles, not just refresh on
+        # unrelated pan/zoom/resize events.
+        self.region.sigRegionChanged.connect(lambda: self.region_changed.emit())
         self.plot_p.addItem(self.region)
     
     def remove_region_selector(self) -> None:

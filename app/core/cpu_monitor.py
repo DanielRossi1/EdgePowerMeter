@@ -39,19 +39,36 @@ class CPUUsageMonitor:
                 return None
         return None
 
+    @staticmethod
+    def _parse_proc_stat_line(line: str) -> Optional[tuple[int, int]]:
+        """Parse the aggregate 'cpu' line of /proc/stat.
+
+        Returns:
+            (total, idle) cumulative jiffies, or None if the line is invalid.
+        """
+        parts = line.split()
+        if not parts or parts[0] != "cpu":
+            return None
+        # user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
+        values = list(map(int, parts[1:]))
+        if len(values) < 4:
+            return None
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        # The kernel already folds guest/guest_nice into user/nice, so they must
+        # be excluded from the total to avoid double-counting (matches psutil).
+        guest = values[8] if len(values) > 8 else 0
+        guest_nice = values[9] if len(values) > 9 else 0
+        total = sum(values) - guest - guest_nice
+        return total, idle
+
     def _get_proc_stat_usage(self) -> Optional[float]:
         try:
             with open("/proc/stat", "r", encoding="utf-8") as f:
                 line = f.readline()
-            parts = line.split()
-            if not parts or parts[0] != "cpu":
+            parsed = self._parse_proc_stat_line(line)
+            if parsed is None:
                 return None
-            # user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
-            values = list(map(int, parts[1:]))
-            if len(values) < 4:
-                return None
-            idle = values[3] + (values[4] if len(values) > 4 else 0)
-            total = sum(values)
+            total, idle = parsed
         except Exception:
             return None
 

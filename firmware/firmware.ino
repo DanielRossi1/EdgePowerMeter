@@ -1,14 +1,14 @@
 /**
  * @file EdgePowerMeter.ino
  * @brief Real-time power monitoring firmware for embedded AI workload analysis
- * @version 1.6.0
+ * @version 1.7.0
  * 
  * This firmware reads voltage, current, and power measurements from an INA226
  * power monitor and outputs CSV-formatted data via serial for logging and analysis.
  * 
  * Architecture:
  *   ESP32-C3 is single-core RISC-V. Optimization is achieved through:
- *   - High baudrate serial (921600) for faster data transfer
+ *   - High baudrate serial (2000000) for faster data transfer
  *   - Efficient buffered output to minimize blocking
  *   - Optimized measurement timing with hardware interrupts
  * 
@@ -24,7 +24,7 @@
  *   - RTC: DS3231 (I2C) with SQW connected to GPIO
  *   - Shunt Resistor: 0.01Ω (R2512)
  * 
- * Serial Output Format (921600 baud):
+ * Serial Output Format (2000000 baud):
  *   Timestamp,Voltage[V],Current[A],Power[W]
  *   2025-11-30 12:34:56.123,12.345,1.234,15.234
  * 
@@ -49,7 +49,7 @@
 // Version
 // =============================================================================
 
-#define FIRMWARE_VERSION "1.6.0"
+#define FIRMWARE_VERSION "1.7.0"
 #define FIRMWARE_NAME "EdgePowerMeter"
 
 // =============================================================================
@@ -81,12 +81,15 @@ namespace Config {
     constexpr unsigned long DISPLAY_INTERVAL_MS = 100;      // 10 Hz display update (OLED is slow)
     
     // Serial settings
-    // 921600 baud for faster data transfer (ESP32-C3 USB-CDC supports high speeds)
+    // 2000000 baud for faster data transfer (ESP32-C3 USB-CDC supports high speeds)
     constexpr unsigned long SERIAL_BAUD = 2000000;
     
     // RTC settings
-    // Set to true to force RTC update on every upload (useful for initial setup)
-    constexpr bool FORCE_RTC_UPDATE = true;
+    // false = production behavior: the battery-backed DS3231 keeps its time across
+    // reboots and only re-syncs to compile time if it actually lost power
+    // (rtc.lostPower()). Set to true only for a one-time forced sync during setup,
+    // then flash back to false so power cycles don't reset the clock to build time.
+    constexpr bool FORCE_RTC_UPDATE = false;
 }
 
 // =============================================================================
@@ -221,7 +224,10 @@ void setup() {
     Serial.println(F("[INFO] Initializing..."));
     
     Wire.begin();
-    Wire.setClock(1000000);  // Increase I2C speed to 1 MHz (fast mode plus on ESP32-C3)
+    // 400 kHz (I2C Fast mode): the DS3231 RTC and SSD1306 are both rated for a
+    // 400 kHz maximum. Running the shared bus at 1 MHz exceeded the RTC spec and
+    // could cause intermittent corrupt timestamp reads.
+    Wire.setClock(400000);
     
     // Initialize display (using OLEDStatus library)
     if (!display.begin(Config::SCREEN_ADDRESS)) {

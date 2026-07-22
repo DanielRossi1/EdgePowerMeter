@@ -9,17 +9,52 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QLabel
 from PySide6.QtGui import QFont
 
-# Enable OpenGL acceleration for smooth 60+ FPS rendering
-_OPENGL_AVAILABLE = False
-try:
-    import OpenGL
-    pg.setConfigOptions(useOpenGL=True, enableExperimental=True)
-    _OPENGL_AVAILABLE = True
-except ImportError:
-    pass  # OpenGL not available, use software rendering
-
 from ..theme import ThemeColors
 from .plot_buffers import PlotBuffers
+
+# Whether OpenGL-accelerated rendering has been probed and found usable.
+# None = not yet checked, True/False = checked and cached.
+_opengl_checked: Optional[bool] = None
+
+
+def _opengl_actually_works() -> bool:
+    """Verify a real GL context can be created, not just that the PyOpenGL
+    Python bindings import cleanly.
+
+    A sandboxed install (snap/flatpak) can bundle PyOpenGL while the host's
+    GL driver - hardware *and* the swrast software fallback - fails to load
+    inside the confined environment. Trusting `import OpenGL` alone then
+    makes pyqtgraph switch its viewport to QOpenGLWidget, which cannot get a
+    context there; Qt's whole backing-store compositor then fails too,
+    breaking the entire window instead of just falling back to the raster
+    (non-GL) painter that works everywhere.
+    """
+    try:
+        import OpenGL  # noqa: F401
+    except ImportError:
+        return False
+
+    try:
+        from PySide6.QtGui import QOffscreenSurface, QOpenGLContext
+        surface = QOffscreenSurface()
+        surface.create()
+        if not surface.isValid():
+            return False
+        ctx = QOpenGLContext()
+        if not ctx.create():
+            return False
+        return bool(ctx.makeCurrent(surface))
+    except Exception:
+        return False
+
+
+def _opengl_available() -> bool:
+    """Cached OpenGL capability check (requires a QApplication to exist)."""
+    global _opengl_checked
+    if _opengl_checked is None:
+        _opengl_checked = _opengl_actually_works()
+        pg.setConfigOptions(useOpenGL=_opengl_checked, enableExperimental=_opengl_checked)
+    return _opengl_checked
 
 
 class PlotWidget(pg.GraphicsLayoutWidget):
@@ -51,6 +86,10 @@ class PlotWidget(pg.GraphicsLayoutWidget):
     ZOOM_FACTOR = 1.2
     
     def __init__(self, theme: ThemeColors, parent=None):
+        # Decide GL vs raster rendering before building any plot items -
+        # pyqtgraph applies useOpenGL per-viewport at creation time.
+        _opengl_available()
+
         super().__init__(parent)
         self.theme = theme
         self.setBackground(theme.bg_secondary)

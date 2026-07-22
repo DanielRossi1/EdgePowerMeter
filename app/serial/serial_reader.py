@@ -40,6 +40,14 @@ class SerialReader(QtCore.QThread):
     STALE_WARNING_S = 3.0
     STALE_FATAL_S = 15.0
 
+    # Before the *first* measurement, the device may still be booting: the
+    # firmware's SQW wait alone can take up to ~2.5s when the RTC's SQW pin
+    # isn't wired (falls back to polling), on top of the display/RTC/INA226
+    # init delays - boot can easily take 3-4s. These looser thresholds only
+    # apply pre-first-sample so that's not misreported as a stall.
+    FIRST_SAMPLE_WARNING_S = 8.0
+    FIRST_SAMPLE_FATAL_S = 20.0
+
     def __init__(self, port: str, baud: int = SerialConfig.DEFAULT_BAUD, 
                  target_sample_rate: int = 0, max_device_rate: int = 400, parent=None):
         super().__init__(parent)
@@ -62,7 +70,8 @@ class SerialReader(QtCore.QThread):
             return
 
         self._running = True
-        last_data_time = time.monotonic()
+        connect_time = time.monotonic()
+        last_data_time = None  # None until the first valid measurement arrives
         stale_warned = False
 
         while self._running:
@@ -70,14 +79,20 @@ class SerialReader(QtCore.QThread):
                 line = self._port_handler.readline()
 
                 if not line:
-                    elapsed = time.monotonic() - last_data_time
-                    if elapsed >= self.STALE_FATAL_S:
+                    if last_data_time is None:
+                        elapsed = time.monotonic() - connect_time
+                        warn_at, fatal_at = self.FIRST_SAMPLE_WARNING_S, self.FIRST_SAMPLE_FATAL_S
+                    else:
+                        elapsed = time.monotonic() - last_data_time
+                        warn_at, fatal_at = self.STALE_WARNING_S, self.STALE_FATAL_S
+
+                    if elapsed >= fatal_at:
                         self.error.emit(
                             f"Nessun dato ricevuto da {elapsed:.0f}s: il dispositivo "
                             "potrebbe essersi bloccato o essere stato scollegato."
                         )
                         break
-                    if elapsed >= self.STALE_WARNING_S and not stale_warned:
+                    if elapsed >= warn_at and not stale_warned:
                         stale_warned = True
                         self.data_stale.emit(elapsed)
                     continue

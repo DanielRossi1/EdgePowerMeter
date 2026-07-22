@@ -585,7 +585,30 @@ class SettingsDialog(QDialog):
         license_layout.addWidget(license_info)
         
         layout.addWidget(license_group)
-        
+
+        # GPU rendering group
+        gpu_group = QGroupBox("Rendering")
+        gpu_layout = QVBoxLayout(gpu_group)
+        gpu_layout.setSpacing(8)
+
+        gpu_info = QLabel(
+            "ℹ️ The app probes GPU rendering once and remembers the result. "
+            "Use this if you changed GPUs/drivers or graphics still looks wrong."
+        )
+        gpu_info.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        gpu_info.setWordWrap(True)
+        gpu_layout.addWidget(gpu_info)
+
+        redetect_btn = QPushButton("Re-detect GPU rendering on next launch")
+        redetect_btn.clicked.connect(self._on_redetect_gpu)
+        gpu_layout.addWidget(redetect_btn)
+
+        self.gpu_redetect_status = QLabel("")
+        self.gpu_redetect_status.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        gpu_layout.addWidget(self.gpu_redetect_status)
+
+        layout.addWidget(gpu_group)
+
         # System info
         import sys
         import platform
@@ -611,7 +634,14 @@ class SettingsDialog(QDialog):
         
         layout.addStretch()
         return widget
-    
+
+    def _on_redetect_gpu(self) -> None:
+        """Clear the cached GPU rendering mode so the next launch re-probes."""
+        from ...core.gpu_preflight import clear_cache
+
+        clear_cache()
+        self.gpu_redetect_status.setText("Will re-detect on next launch.")
+
     def _load_settings(self) -> None:
         """Load current settings into UI."""
         self.dark_mode_check.setChecked(self.settings.dark_mode)

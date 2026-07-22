@@ -1,5 +1,5 @@
 name: edgepowermeter
-version: '1.7.1'
+version: '1.7.2'
 title: EdgePowerMeter
 summary: Real-time power analyser for embedded AI workloads
 description: |
@@ -66,6 +66,7 @@ parts:
       - libxcb-xinput0
       - libxcb-xkb1
       - libxcb-render-util0
+      - pciutils
     override-build: |
       craftctl default
       # Create launcher script

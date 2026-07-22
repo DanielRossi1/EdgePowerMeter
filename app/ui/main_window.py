@@ -101,6 +101,7 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.setSpacing(12)
         
         self._create_header(main_layout)
+        self._create_gpu_banner(main_layout)
         self._create_connection_bar(main_layout)
         
         content = QtWidgets.QHBoxLayout()
@@ -157,7 +158,46 @@ class MainWindow(QtWidgets.QMainWindow):
         header.addWidget(self.settings_btn)
         
         parent.addLayout(header)
-    
+
+    def _create_gpu_banner(self, parent: QtWidgets.QVBoxLayout) -> None:
+        """Persistent warning bar for degraded (software) GPU rendering.
+
+        Hidden by default; shown via show_software_rendering_banner() when
+        app.core.gpu_preflight had to fall back past both the default and
+        NVIDIA-PRIME-offload GL paths, so the user sees a clear reason
+        instead of a sluggish or blank-looking window.
+        """
+        self.gpu_banner = QtWidgets.QFrame()
+        self.gpu_banner.setStyleSheet(
+            f"background-color: {self.theme.accent_warning}; border-radius: 6px;"
+        )
+        banner_layout = QtWidgets.QHBoxLayout(self.gpu_banner)
+        banner_layout.setContentsMargins(12, 8, 12, 8)
+
+        label = QtWidgets.QLabel(
+            "⚠ Rendering software attivo: l'accelerazione grafica GPU non è "
+            "disponibile su questo sistema. Prestazioni ridotte."
+        )
+        label.setStyleSheet("color: #1a1a1a; font-weight: 500;")
+        label.setWordWrap(True)
+        banner_layout.addWidget(label, stretch=1)
+
+        close_btn = QtWidgets.QPushButton("✕")
+        close_btn.setFixedWidth(28)
+        close_btn.setStyleSheet("background: transparent; border: none; color: #1a1a1a; font-weight: 700;")
+        close_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        close_btn.clicked.connect(self.gpu_banner.hide)
+        banner_layout.addWidget(close_btn)
+
+        self.gpu_banner.hide()
+        parent.addWidget(self.gpu_banner)
+
+    def show_software_rendering_banner(self) -> None:
+        """Surface the degraded-rendering warning set by app.main after
+        app.core.gpu_preflight.ensure_gpu_ready() fell back to software
+        rendering."""
+        self.gpu_banner.show()
+
     def _create_connection_bar(self, parent: QtWidgets.QVBoxLayout) -> None:
         frame = QtWidgets.QFrame()
         frame.setProperty("class", "card")
@@ -418,8 +458,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Check if port is available
-        from serial.tools import list_ports
-        available = [p.device for p in list_ports.comports()]
+        available = PortDiscovery.list_ports()
         
         if self._last_port in available:
             self.status_label.setText(f"● Reconnecting to {self._last_port}...")

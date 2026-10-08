@@ -231,3 +231,37 @@ def test_run_probe_true_on_zero_exit(monkeypatch):
         lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
     )
     assert gpu_preflight._run_probe({}, "default") is True
+
+
+def test_probe_command_in_frozen_build_does_not_use_dash_m(monkeypatch):
+    """Regression: in a PyInstaller build `exe -m app.core.gpu_probe` started
+    the whole application again, recursively (runaway processes)."""
+    from app.core import gpu_preflight as gp
+    monkeypatch.setattr(gp.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(gp.sys, "executable", "/opt/EdgePowerMeter")
+    assert gp._probe_command() == ["/opt/EdgePowerMeter"]
+    calls = {}
+
+    def fake_run(cmd, env, **kw):
+        calls["env"] = env
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(gp.subprocess, "run", fake_run)
+    assert gp._run_probe({}, "default")
+    assert calls["env"][gp.PROBE_ENV_VAR] == "1"
+
+
+def test_main_runs_only_the_probe_when_flagged(monkeypatch):
+    import app.main as main_mod
+    from app.core import gpu_probe
+    monkeypatch.setenv("EPM_GPU_PROBE", "1")
+    monkeypatch.setattr(gpu_probe, "probe", lambda: True)
+    monkeypatch.setattr(main_mod, "ensure_gpu_ready",
+                        lambda: (_ for _ in ()).throw(AssertionError("app started")))
+    import pytest
+    with pytest.raises(SystemExit) as e:
+        main_mod.main()
+    assert e.value.code == 0

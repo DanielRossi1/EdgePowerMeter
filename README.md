@@ -52,22 +52,21 @@
 - 🔧 **0.01Ω shunt** resistor for current sensing
 
 ### Software
-- 📊 Real-time voltage, current, and power graphs
-- 🚀 **OpenGL accelerated** rendering for smooth 60+ FPS
-- 📈 Live statistics with min/max/average values
-- 💾 CSV data export with full measurement history
-- 📂 **CSV import** to reload and re-analyze data
-- 📄 Professional PDF report with **graphs included**
-- 📉 **FFT spectrum analysis** optimized for DC systems with dynamic loads
-- ⚡ **Power supply quality analysis** - voltage ripple, load regulation, settling time
-- 🎯 **Sampling rate control** - configurable subsampling from device rate
-- 🎨 Dark and Light theme support
-- ⚙️ **Persistent settings** - preferences saved automatically
-- 🔌 **Auto-reconnect** with OS event-based port monitoring
-- 🔍 Zoom and pan on X-axis (Y-axis auto-scales)
-- 🖱️ **Cursor values on hover** with crosshair
-- 📐 Selection region for detailed analysis
-- ⏱️ **Time-based scrolling window** (configurable)
+- 📊 Real-time voltage, current and power plots with peak-preserving decimation (smooth even after hours at ~1 kHz)
+- ⏱️ **Device-clock time base** (firmware 2.x): sample spacing, energy and spectrum are not distorted by USB/PC latency
+- 🧮 **Lost-sample detection** (sequence numbers) and real-time energy, charge, min/max and average power
+- 🎛️ **Remote sensor configuration**: INA226 averaging and conversion times, presets from ~2 Hz to ~900 Hz, saved on the device
+- 🕐 **Clock sync** of the DS3231 with the PC, with live device–PC offset
+- 🎯 **Calibration** in the app: shunt value, current zero ("zero now"), voltage/current gain and offset
+- 📐 **Analysis page**: selectable range, per-quantity statistics, power supply quality (ripple, noise, load regulation, settling time) and frequency spectrum
+- 🚩 **Markers**: press `M` (or right-click the plot) to mark events; every segment between markers gets duration, energy, average and peak power
+- 🏁 **Benchmark mode**: energy per inference, inferences per joule and FPS/W, also net of the idle power
+- 💽 **Continuous recording**: every acquisition is saved while it runs to a visible CSV file (crash-safe, no duplicates, no hidden files)
+- 💾 CSV export/import (decimal comma, date/time or Unix time) and PDF reports with vector charts
+- 🌍 **5 languages** (English, Italiano, Español, Français, Deutsch), automatically selected from the system, translated offline with a local model
+- 🎨 Dark, light or system theme, configurable units, digits, refresh rate, time window and more
+- 🔌 **Safe auto-reconnect**: after an unplug the recording continues; a manual Stop never restarts it
+- ⌨️ Keyboard shortcuts (Ctrl+R, Ctrl+O, Ctrl+E, Ctrl+P, Ctrl+1…5)
 
 ---
 
@@ -79,10 +78,10 @@ The EdgePowerMeter desktop application provides a modern interface for real-time
 
 ![EdgePowerMeter GUI](assets/prototype/app/gui.png)
 
-The main window displays three synchronized graphs showing:
-- **Voltage** (V) - Blue trace
-- **Current** (mA) - Orange trace  
-- **Power** (mW) - Green trace
+The window has a navigation rail with five pages: **Live**, **Analysis**,
+**Device**, **Settings** and **About**. The Live page shows three synchronized
+plots (voltage, current, power) with live value tiles; the Analysis page works
+on a selected range of the recording. (Screenshots below are from version 1.x.)
 
 ### Statistics Panel
 
@@ -195,14 +194,12 @@ chmod +x EdgePowerMeter
 git clone https://github.com/DanielRossi1/EdgePowerMeter.git
 cd EdgePowerMeter
 
-# Install Python dependencies
-pip install PySide6 pyqtgraph pyserial reportlab matplotlib numpy scipy
-
-# Optional: Install PyOpenGL for GPU-accelerated rendering
-pip install PyOpenGL PyOpenGL_accelerate
+# Create a virtual environment and install the app with its dependencies
+python3 -m venv .venv
+.venv/bin/pip install -e .          # PySide6, pyqtgraph, pyserial, reportlab, numpy, PyOpenGL
 
 # Run the application
-python run.py
+.venv/bin/python run.py
 ```
 
 ### Firmware
@@ -210,29 +207,23 @@ python run.py
 #### Arduino IDE
 1. Install ESP32 board support
 2. Install required libraries:
-   - `INA226` by Rob Tillaart
    - `Adafruit_GFX`
    - `Adafruit_SSD1306`
    - `RTClib` by Adafruit
+   (the Rob Tillaart `INA226` library is no longer needed since firmware 2.0)
 3. Open `firmware/firmware.ino`
-4. Select board: `ESP32C3 Dev Module`
+4. Select board `ESP32C3 Dev Module` and set **USB CDC On Boot: Enabled**
 5. Upload
 
 #### Arduino CLI
 
 ```bash
-# Compile
-arduino-cli compile --fqbn esp32:esp32:esp32c3 firmware
-
-# Upload
-arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32c3 firmware
+arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc firmware
+arduino-cli upload -p /dev/ttyACM0 --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc firmware
 ```
 
-#### PlatformIO
-
-```bash
-pio run --target upload
-```
+The desktop app also works with firmware 1.x, but device time, lost-sample
+detection, sensor configuration and clock sync require firmware 2.x.
 
 ---
 
@@ -274,24 +265,23 @@ Output files are created in `dist/`:
 
 ### Serial Output Format
 
-The firmware outputs CSV data at **921600 baud** with millisecond-precision timestamps:
+At boot the firmware prints human-readable CSV (also what firmware 1.x sends),
+so it can be used with any serial monitor:
 
 ```
 Timestamp,Voltage[V],Current[A],Power[W]
-2025-11-30 12:34:56.123,5.0123,0.2500,1.2531
-2025-11-30 12:34:56.223,5.0118,0.2498,1.2525
+2026-10-08 12:34:56.123,5.01250,0.250000,1.253125
 ```
 
-The timestamp uses the DS3231 RTC with SQW sync for ±2ppm accuracy.
+The desktop app performs a handshake and switches the device to a compact RAW
+format with device time in µs, a sequence number and the raw INA226 registers.
+See **[docs/PROTOCOL.md](docs/PROTOCOL.md)** for the full protocol and the
+command set (`HELLO`, `GET`, `SET AVG/VCT/ICT/OLED/STREAM/SHUNT`, `SYNC`, `SAVE`).
 
 ### Reading Serial Data (Linux)
 
 ```bash
-# Using screen
-screen /dev/ttyUSB0 921600
-
-# Using cat
-stty -F /dev/ttyUSB0 921600 && cat /dev/ttyUSB0
+screen /dev/ttyACM0 2000000
 ```
 
 ### Calculating FPS per Watt
@@ -323,23 +313,18 @@ FPS/W = Inference_FPS / Average_Power_W
 
 ## 🛠️ Configuration
 
-### Firmware Settings
+### Sensor and Calibration
 
-Key configuration in `firmware/firmware.ino`:
-
-```cpp
-namespace Config {
-    constexpr float SHUNT_RESISTANCE = 0.010f;      // Ohms
-    constexpr float CURRENT_LSB_MA = 0.100f;        // mA resolution
-    constexpr uint16_t INA226_AVERAGING = 16;       // Samples averaged
-    constexpr uint32_t MEASUREMENT_INTERVAL = 10;   // ms between readings
-    constexpr uint32_t SERIAL_BAUD = 921600;        // High-speed serial
-}
-```
+With firmware 2.x, averaging and conversion times are set from the **Device**
+page of the app (or with serial commands) and can be stored on the device with
+*Save as device default*. Calibration (shunt value, zero offset, gain) is
+applied by the app, so no reflashing is needed.
 
 ### RTC Synchronization
 
-Set `FORCE_RTC_UPDATE = true` in firmware to sync RTC with compile time on first boot.
+Use *Sync clock with PC* on the Device page (or enable automatic sync on
+connect). `FORCE_RTC_UPDATE = true` in the firmware still forces a one-time sync
+to the compile time.
 
 ---
 
@@ -349,10 +334,11 @@ Set `FORCE_RTC_UPDATE = true` in firmware to sync RTC with compile time on first
 |-----------|---------|
 | Voltage Range | 0 - 36V |
 | Current Range | ±3.2A (with 0.01Ω shunt) |
-| Resolution | 1.25mV / 0.1mA |
-| Sampling Rate | ~100 Hz |
-| Serial Baud | 921600 |
-| Display Update | 100ms |
+| Resolution | 1.25 mV / 0.25 mA (2.5 µV shunt LSB) |
+| Sampling Rate | ~2 Hz – ~900 Hz (configurable, default ~893 Hz) |
+| Time Stamping | Device µs clock, anchored to the DS3231 SQW (±2 ppm) |
+| Serial | Native USB-CDC (2000000 baud nominal) |
+| Display Update | 4 Hz (non-blocking) |
 
 ---
 
@@ -360,35 +346,23 @@ Set `FORCE_RTC_UPDATE = true` in firmware to sync RTC with compile time on first
 
 ```
 EdgePowerMeter/
-├── firmware/               # Arduino firmware folder
-│   ├── firmware.ino        # Main firmware sketch
-│   ├── PrecisionTime.h/cpp # Millisecond-precision timing library
-│   └── OLEDStatus.h/cpp    # OLED display library
-├── run.py                  # Application entry point
-├── build.py                # Build script for executables
+├── firmware/                 # ESP32-C3 firmware (Arduino sketch)
+│   ├── firmware.ino          # Sampling loop, protocol, commands
+│   ├── INA226Lite.h/cpp      # Minimal INA226 driver
+│   ├── PrecisionTime.h/cpp   # DS3231 SQW time anchors
+│   └── OLEDStatus.h/cpp      # Non-blocking OLED display
 ├── app/
-│   ├── main.py             # Application bootstrap
-│   ├── version.py          # Version info
-│   ├── serial/
-│   │   └── reader.py       # Serial communication
-│   └── ui/
-│       ├── main_window.py  # Main GUI
-│       ├── theme.py        # Dark/Light themes
-│       ├── settings.py     # Settings dialog
-│       ├── report.py       # PDF/CSV export & import
-│       └── widgets/        # Reusable UI components
-│           ├── plot_widget.py
-│           ├── plot_buffers.py
-│           ├── stat_card.py
-│           └── port_discovery.py
-├── assets/
-│   └── prototype/          # Screenshots and photos
-├── docs/
-│   ├── BUILD.md            # Build instructions
-│   ├── HARDWARE.md         # Hardware documentation
-│   └── SOFTWARE.md         # Software documentation
-├── Manufacture/            # PCB production files
-└── Schematics/             # Circuit diagrams
+│   ├── main.py               # Bootstrap (GPU preflight, QApplication)
+│   ├── core/                 # Samples store, statistics, PSU quality, spectrum, settings
+│   ├── serial/               # Port I/O, protocol decoder, reader thread
+│   ├── export/               # CSV import/export, PDF report, unit formatting
+│   ├── i18n/                 # Runtime translations + generated catalogs
+│   └── ui/                   # Main window, controller, pages, widgets, theme
+├── tools/i18n/               # Offline machine-translation tool
+├── tests/                    # pytest suite (headless, fake device)
+├── docs/                     # BUILD, HARDWARE, SOFTWARE, PROTOCOL
+├── Manufacture/              # PCB production files
+└── Schematics/               # Circuit diagrams
 ```
 
 ---

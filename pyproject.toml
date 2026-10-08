@@ -31,13 +31,11 @@ classifiers = [
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "PySide6>=6.4.0",
+    "PySide6-Essentials>=6.4.0",  # Core/Gui/Widgets/Svg/OpenGL only: no WebEngine & co.
     "pyqtgraph>=0.13.0",
     "pyserial>=3.5",
     "reportlab>=4.0.0",
     "numpy>=1.20.0",
-    "scipy>=1.7.0",  # FFT spectrum analysis
-    "matplotlib>=3.5.0",
     "PyOpenGL>=3.1.0",  # Hardware acceleration for smooth plotting
 ]
 
@@ -66,6 +64,9 @@ version = {attr = "app.version.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.setuptools.package-data]
+"app.i18n" = ["locales/*.json"]
 
 [tool.black]
 line-length = 100

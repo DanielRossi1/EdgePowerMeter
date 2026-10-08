@@ -1,868 +1,622 @@
-"""PDF report generation for EdgePowerMeter."""
+"""PDF report generation (vector charts, no matplotlib)."""
 
 from __future__ import annotations
-from pathlib import Path
+
+import math
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List
-from io import BytesIO
-import csv
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
 
-from ..version import __version__, APP_NAME
-from ..core import Statistics, MeasurementRecord, HarmonicAnalyzer, PowerSupplyAnalyzer
+from ..core.markers import MarkerList
+from ..core.power_supply_quality import PowerSupplyAnalyzer, rating_label
+from ..core.samples import Samples
+from ..core.spectrum import analyze_spectrum
+from ..core.statistics import Statistics
+from ..i18n import tr
+from ..version import APP_NAME, __version__
+from .units import format_duration, format_si
+
+# Report palette (print friendly, independent of the UI theme)
+INK = "#1f2430"
+MUTED = "#6b7280"
+GRID = "#e5e7eb"
+HEADER_BG = "#eef2ff"
+ACCENT = "#3b5bdb"
+COLOR_V = "#2563eb"
+COLOR_I = "#d97706"
+COLOR_P = "#059669"
 
 
-class ReportGenerator:
-    """Generate PDF and CSV reports from measurement data."""
-    
-    def __init__(self):
-        self.include_fft = False  # Set by caller based on settings
-        self.include_harmonic_analysis = False
-        self.include_psu_analysis = True  # Power supply quality analysis
-        self.harmonic_max_order = 10
-        self.harmonic_signal = "current"
-        self.nominal_voltage = None  # Auto-detect if None
-    
-    def export_csv(self, filepath: Path, records: List[MeasurementRecord], 
-                   separator: str = ',') -> None:
-        """Export measurements to CSV file.
-        
-        Includes both absolute timestamp and relative time (seconds from start).
-        """
-        with open(filepath, 'w', newline='') as f:
-            writer = csv.writer(f, delimiter=separator)
-            writer.writerow(['Timestamp', 'RelativeTime[s]', 'Voltage[V]', 'Current[A]', 'Power[W]'])
-            for r in records:
-                writer.writerow([
-                    r.timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
-                    f"{r.relative_time:.6f}",
-                    f"{r.voltage:.6f}",
-                    f"{r.current:.6f}",
-                    f"{r.power:.6f}",
-                ])
-    
-    def export_pdf(self, filepath: Path, stats: Statistics, 
-                   records: List[MeasurementRecord]) -> None:
-        """Export report to PDF file with graphs."""
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import mm
-        from reportlab.lib.enums import TA_CENTER
-        from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, 
-            KeepTogether, Image, PageBreak
-        )
-        
-        doc = SimpleDocTemplate(
-            str(filepath),
-            pagesize=A4,
-            rightMargin=20*mm,
-            leftMargin=20*mm,
-            topMargin=20*mm,
-            bottomMargin=20*mm,
-            title=f"{APP_NAME} Report",
-            author=APP_NAME,
-            subject="Power measurement report",
-        )
-        
-        styles = getSampleStyleSheet()
-        
-        # Custom styles
-        title_style = ParagraphStyle(
-            name='ReportTitle',
-            parent=styles['Heading1'],
-            fontSize=24,
-            spaceAfter=20,
-            textColor=colors.HexColor('#1a1a2e'),
-            alignment=TA_CENTER,
-        )
-        
-        section_style = ParagraphStyle(
-            name='SectionTitle',
-            parent=styles['Heading2'],
-            fontSize=14,
-            spaceBefore=20,
-            spaceAfter=10,
-            textColor=colors.HexColor('#58a6ff'),
-        )
-        
-        story = []
-        
-        # Title
-        story.append(Paragraph("EdgePowerMeter Report", title_style))
-        story.append(Spacer(1, 10))
-        
-        # Metadata
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        start = records[0].timestamp.strftime("%Y-%m-%d %H:%M:%S") if records else "N/A"
-        end = records[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S") if records else "N/A"
-        
-        meta_data = [
-            ["Report Generated:", now],
-            ["Recording Start:", start],
-            ["Recording End:", end],
-            ["Total Samples:", f"{stats.count:,}"],
-            ["Duration:", self._format_duration(stats.duration_seconds)],
-        ]
-        
-        meta_table = Table(meta_data, colWidths=[100, 200])
-        meta_table.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('TEXTCOLOR', (0, 0), (0, -1), colors.HexColor('#8b949e')),
-            ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-            ('ALIGN', (1, 0), (1, -1), 'LEFT'),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ]))
-        story.append(meta_table)
-        story.append(Spacer(1, 20))
-        
-        # Summary Statistics - keep title and table together
-        summary_data = [
-            ["Metric", "Min", "Max", "Average", "Std Dev"],
-            ["Voltage (V)", 
-             f"{stats.voltage_min:.4f}", f"{stats.voltage_max:.4f}", 
-             f"{stats.voltage_avg:.4f}", f"{stats.voltage_std:.4f}"],
-            ["Current (A)", 
-             f"{stats.current_min:.4f}", f"{stats.current_max:.4f}", 
-             f"{stats.current_avg:.4f}", f"{stats.current_std:.4f}"],
-            ["Power (W)", 
-             f"{stats.power_min:.4f}", f"{stats.power_max:.4f}", 
-             f"{stats.power_avg:.4f}", f"{stats.power_std:.4f}"],
-        ]
-        
-        summary_table = Table(summary_data, colWidths=[80, 70, 70, 70, 70])
-        summary_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#58a6ff')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#30363d')),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f6f8fa')]),
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-        ]))
-        # Energy Analysis - keep title and table together
-        energy_data = [
-            ["Metric", "Value", "Unit"],
-            ["Total Energy", f"{stats.energy_wh:.6f}", "Wh"],
-            ["Total Energy", f"{stats.energy_wh * 1000:.4f}", "mWh"],
-            ["Total Charge", f"{stats.charge_ah:.6f}", "Ah"],
-            ["Total Charge", f"{stats.charge_ah * 1000:.4f}", "mAh"],
-            ["Average Power", f"{stats.power_avg:.4f}", "W"],
-            ["Peak Power", f"{stats.power_max:.4f}", "W"],
-        ]
-        
-        energy_table = Table(energy_data, colWidths=[120, 100, 60])
-        energy_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3fb950')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#30363d')),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f6f8fa')]),
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-        ]))
-        # Derived Metrics
-        sampling_rate = stats.count / stats.duration_seconds if stats.duration_seconds > 0 else 0
-        power_factor = stats.power_avg / (stats.voltage_avg * stats.current_avg) if (stats.voltage_avg * stats.current_avg) > 0 else 0
-        impedance = stats.voltage_avg / stats.current_avg if stats.current_avg > 0 else 0
-        
-        derived_data = [
-            ["Metric", "Value", "Description"],
-            ["Sampling Rate", f"{sampling_rate:.1f} Hz", "Samples per second"],
-            ["Voltage Ripple", f"{stats.voltage_max - stats.voltage_min:.4f} V", "Peak-to-peak"],
-            ["Current Ripple", f"{stats.current_max - stats.current_min:.4f} A", "Peak-to-peak"],
-            ["Power Factor Est.", f"{power_factor:.3f}", "P / (V × I)"],
-            ["Impedance Est.", f"{impedance:.2f} Ω", "V / I average"],
-        ]
-        
-        derived_table = Table(derived_data, colWidths=[100, 80, 180])
-        derived_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#a371f7')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('ALIGN', (1, 0), (1, -1), 'CENTER'),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#30363d')),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f6f8fa')]),
-            ('TOPPADDING', (0, 0), (-1, -1), 6),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ]))
-        # Summary/Energy/Derived kept as a single unit: on its own each table
-        # is small enough to tempt SimpleDocTemplate into stranding it alone
-        # on a fresh page (half the previous page and most of the next left
-        # blank). Grouping them means that decision is made once, for all
-        # three together, instead of three times.
-        story.append(KeepTogether([
-            Paragraph("Summary Statistics", section_style),
-            summary_table,
-            Spacer(1, 20),
-            Paragraph("Energy Analysis", section_style),
-            energy_table,
-            Spacer(1, 20),
-            Paragraph("Derived Metrics", section_style),
-            derived_table,
-        ]))
+@dataclass
+class ReportOptions:
+    title: str = ""
+    notes: str = ""
+    include_graphs: bool = True
+    include_psu: bool = True
+    include_spectrum: bool = False
+    spectrum_signal: str = "current"
+    metadata: Dict[str, str] = field(default_factory=dict)   # extra key/value rows
+    markers: Optional[MarkerList] = None
+    # (BenchmarkInput, (t0, t1), range label) from the Analysis page
+    benchmark: Optional[tuple] = None
+    device: Dict[str, str] = field(default_factory=dict)     # sensor + calibration
 
-        # Generate graphs
+
+def export_pdf(path: Path, s: Samples, options: ReportOptions,
+               progress: Optional[Callable[[float], None]] = None) -> Statistics:
+    """Build the report for `s` and write it to `path`. Returns the statistics."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (KeepTogether, PageBreak, Paragraph, SimpleDocTemplate,
+                                    Spacer, Table, TableStyle)
+
+    stats = Statistics.from_samples(s)
+    if stats is None:
+        raise ValueError(tr("At least 2 samples are required."))
+
+    def step(x: float) -> None:
+        if progress:
+            progress(x)
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=20, textColor=colors.HexColor(INK),
+                        spaceAfter=4, alignment=TA_LEFT)
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=13, textColor=colors.HexColor(ACCENT),
+                        spaceBefore=10, spaceAfter=6)
+    body = ParagraphStyle("Body", parent=styles["Normal"], fontSize=9.5, textColor=colors.HexColor(INK),
+                          leading=13)
+    muted = ParagraphStyle("Muted", parent=body, textColor=colors.HexColor(MUTED), fontSize=8.5)
+    tile_value = ParagraphStyle("TileV", parent=body, fontSize=15, leading=18,
+                                fontName="Helvetica-Bold", textColor=colors.HexColor(INK))
+    tile_name = ParagraphStyle("TileN", parent=muted, fontSize=7.5, leading=9)
+
+    def table(rows: List[List[str]], widths: Sequence[float], header: bool = True,
+              align_right_from: int = 1) -> Table:
+        t = Table(rows, colWidths=widths, hAlign="LEFT", repeatRows=1 if header else 0)
+        style = [
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.8),
+            ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor(INK)),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.4, colors.HexColor(GRID)),
+            ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+            ("ALIGN", (align_right_from, 0), (-1, -1), "RIGHT"),
+        ]
+        if header:
+            style += [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(HEADER_BG)),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ]
+        t.setStyle(TableStyle(style))
+        return t
+
+    def tiles(items: List[Tuple[str, str]], per_row: int = 3) -> Table:
+        cells = [[Paragraph(_esc(v), tile_value), Paragraph(_esc(n.upper()), tile_name)]
+                 for n, v in items]
+        rows = []
+        for k in range(0, len(cells), per_row):
+            row = cells[k:k + per_row]
+            row += [""] * (per_row - len(row))
+            rows.append(row)
+        w = 170 * mm / per_row
+        t = Table(rows, colWidths=[w] * per_row, hAlign="LEFT")
+        t.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor(GRID)),
+            ("INNERGRID", (0, 0), (-1, -1), 0.6, colors.HexColor(GRID)),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ("LEFTPADDING", (0, 0), (-1, -1), 9),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        return t
+
+    v = s.v.astype(np.float64)
+    i = s.i.astype(np.float64)
+    p = s.p.astype(np.float64)
+    t0, t1 = float(s.t[0]), float(s.t[-1])
+    duration = stats.duration_seconds
+    energy_j = stats.energy_wh * 3600.0
+    avg_power = energy_j / duration if duration > 0 else stats.power_avg
+    markers = [m for m in (options.markers.sorted() if options.markers else []) if t0 <= m.t <= t1]
+
+    story: list = []
+    title = options.title.strip() or tr("Power measurement report")
+    story.append(Paragraph(_esc(title), h1))
+    story.append(Paragraph(_esc(tr("Generated by {app} {version} on {date}", app=APP_NAME,
+                                   version=__version__,
+                                   date=datetime.now().strftime("%Y-%m-%d %H:%M"))), muted))
+    if options.notes.strip():
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(_esc(options.notes).replace("\n", "<br/>"), body))
+    story.append(Spacer(1, 10))
+
+    # --- key figures
+    key = [
+        (tr("Average power"), format_si(avg_power, "W")),
+        (tr("Energy"), f"{format_si(stats.energy_wh, 'Wh')}"),
+        (tr("Duration"), format_duration(duration)),
+        (tr("Peak power"), format_si(stats.power_max, "W")),
+        (tr("Average current"), format_si(stats.current_avg, "A")),
+        (tr("Average voltage"), format_si(stats.voltage_avg, "V")),
+    ]
+    bench = _benchmark_result(s, options.benchmark)
+    if bench is not None:
+        key.append((tr("Throughput per watt (FPS/W)"), f"{bench.rate_per_watt:.4g} /s/W"))
+        key.append((tr("Energy per inference"), format_si(bench.energy_per_unit_j, "J")))
+    story.append(tiles(key))
+    story.append(Spacer(1, 10))
+
+    # --- recording
+    start, end = s.wall_datetime(0), s.wall_datetime(len(s) - 1)
+    meta = [
+        [tr("Start time"), start.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] if start else "-"],
+        [tr("End time"), end.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] if end else "-"],
+        [tr("Duration"), format_duration(duration)],
+        [tr("Samples"), f"{stats.count:,}"],
+        [tr("Average sample rate"), f"{stats.sample_rate_hz:.1f} Hz"],
+    ]
+    meta += [[k, val] for k, val in options.metadata.items()]
+    story.append(Paragraph(tr("Recording"), h2))
+    story.append(table(meta, [55 * mm, 115 * mm], header=False, align_right_from=2))
+
+    # --- summary per quantity
+    def row(name: str, unit: str, x: np.ndarray, mn: float, mx: float, avg: float, sd: float):
+        rms = float(np.sqrt(np.mean(x * x)))
+        return [name] + [format_si(val, unit) for val in (mn, mx, avg, sd, rms, mx - mn)]
+
+    summary = [
+        [tr("Quantity"), tr("Min"), tr("Max"), tr("Average"), tr("Std dev"), tr("RMS"),
+         tr("Peak-to-peak")],
+        row(tr("Voltage"), "V", v, stats.voltage_min, stats.voltage_max, stats.voltage_avg,
+            stats.voltage_std),
+        row(tr("Current"), "A", i, stats.current_min, stats.current_max, stats.current_avg,
+            stats.current_std),
+        row(tr("Power"), "W", p, stats.power_min, stats.power_max, stats.power_avg, stats.power_std),
+    ]
+    crest = stats.current_max / stats.current_rms if stats.current_rms > 0 else float("nan")
+    energy = [
+        [tr("Quantity"), tr("Value")],
+        [tr("Energy"), f"{format_si(stats.energy_wh, 'Wh')}   ({format_si(energy_j, 'J')})"],
+        [tr("Charge"), f"{format_si(stats.charge_ah, 'Ah')}   ({format_si(stats.charge_ah * 3600, 'C')})"],
+        [tr("Average power (energy / time)"), format_si(avg_power, "W")],
+        [tr("Peak power"), format_si(stats.power_max, "W")],
+        [tr("Minimum power"), format_si(stats.power_min, "W")],
+        [tr("Power variability (std / mean)"),
+         f"{stats.power_std / abs(stats.power_avg) * 100:.2f} %" if abs(stats.power_avg) > 1e-12 else "-"],
+        [tr("Current RMS"), format_si(stats.current_rms, "A")],
+        [tr("Current crest factor (peak / RMS)"), f"{crest:.3f}" if math.isfinite(crest) else "-"],
+        [tr("Voltage ripple (peak-to-peak)"),
+         f"{format_si(stats.voltage_max - stats.voltage_min, 'V')}   "
+         f"({(stats.voltage_max - stats.voltage_min) / abs(stats.voltage_avg) * 100:.3f} %)"
+         if abs(stats.voltage_avg) > 1e-9 else "-"],
+    ]
+    if stats.current_avg > 1e-9:
+        energy.append([tr("Average load resistance"), format_si(stats.voltage_avg / stats.current_avg, "Ohm")])
+    story.append(KeepTogether([
+        Paragraph(tr("Summary"), h2),
+        table(summary, [26 * mm] + [24 * mm] * 6),
+    ]))
+    story.append(KeepTogether([
+        Paragraph(tr("Energy and derived quantities"), h2),
+        table(energy, [80 * mm, 70 * mm]),
+    ]))
+    step(0.15)
+
+    # --- markers and segments
+    if markers:
+        from ..core.markers import MarkerList as _ML
+        ml = _ML()
+        for m in markers:
+            ml.put(m.id, m.t, m.label)
+        rows = [[tr("Segment"), tr("Starts at"), tr("Duration"), tr("Average power"), tr("Peak power"),
+                 tr("Energy")]]
+        for seg in ml.segments(s, tr("Beginning"), tr("Finish")):
+            st = seg.stats
+            if st is None:
+                continue
+            avg = st.energy_wh * 3600 / st.duration_seconds if st.duration_seconds > 0 else st.power_avg
+            rows.append([seg.name, f"{seg.start:.3f} s", format_duration(seg.end - seg.start),
+                         format_si(avg, "W"), format_si(st.power_max, "W"), format_si(st.energy_wh, "Wh")])
+        mrows = [[tr("Marker"), tr("Time"), tr("Wall-clock time")]]
+        for m in markers:
+            k = int(np.clip(np.searchsorted(s.t, m.t), 0, len(s) - 1))
+            wall = datetime.fromtimestamp(float(s.wall[k]) + (m.t - float(s.t[k])))
+            mrows.append([m.label, f"{m.t:.3f} s", wall.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]])
+        story.append(Paragraph(tr("Markers and segments"), h2))
+        story.append(table(mrows, [60 * mm, 30 * mm, 60 * mm]))
+        story.append(Spacer(1, 6))
+        story.append(table(rows, [52 * mm, 20 * mm, 24 * mm, 25 * mm, 25 * mm, 24 * mm]))
+
+    # --- benchmark
+    if bench is not None:
+        inp, rng, rng_label = options.benchmark
+        rows = [
+            [tr("Metric"), tr("Value")],
+            [tr("Range"), f"{rng_label}  ({rng[0]:.3f} s - {rng[1]:.3f} s)"],
+            [tr("Duration"), format_duration(bench.duration_s)],
+            [tr("Inferences"), f"{bench.units:,.0f}"],
+            [tr("Throughput"), f"{bench.rate:.4g} /s"],
+            [tr("Average power"), format_si(bench.avg_power_w, "W")],
+            [tr("Energy"), format_si(bench.energy_j, "J")],
+            [tr("Energy per inference"), format_si(bench.energy_per_unit_j, "J")],
+            [tr("Inferences per joule"), f"{bench.units_per_joule:.4g}"],
+            [tr("Throughput per watt (FPS/W)"), f"{bench.rate_per_watt:.4g} /s/W"],
+        ]
+        if bench.idle_power_w is not None:
+            rows += [
+                [tr("Idle power"), format_si(bench.idle_power_w, "W")],
+                [tr("Workload power (net)"), format_si(bench.net_power_w, "W")],
+                [tr("Energy per inference (net)"), "-" if bench.net_energy_per_unit_j is None
+                 else format_si(bench.net_energy_per_unit_j, "J")],
+                [tr("Throughput per watt (net)"), "-" if bench.net_rate_per_watt is None
+                 else f"{bench.net_rate_per_watt:.4g} /s/W"],
+            ]
+        story.append(KeepTogether([Paragraph(tr("Benchmark"), h2), table(rows, [80 * mm, 80 * mm]),
+                                   Spacer(1, 4),
+                                   Paragraph(_esc(tr(
+                                       "Net figures subtract the idle power, so they show only the "
+                                       "energy spent by the workload.")), muted)]))
+    step(0.25)
+
+    # --- graphs
+    if options.include_graphs:
         story.append(PageBreak())
-        story.append(Paragraph("Measurement Graphs", section_style))
-        story.append(Spacer(1, 10))
-        
-        # Create graphs using matplotlib
-        graph_images = self._generate_graphs(records)
-        for img in graph_images:
-            story.append(img)
-            story.append(Spacer(1, 10))
-        
-        # FFT Analysis (if enabled)
-        if self.include_fft:
-            story.append(PageBreak())
-            story.append(Paragraph("Frequency Spectrum Analysis", section_style))
-            story.append(Spacer(1, 5))
-            story.append(Paragraph(
-                "FFT analysis of current signal to identify switching noise, ripple, and periodic patterns.",
-                ParagraphStyle(
-                    name='FFTInfo',
-                    parent=styles['Normal'],
-                    fontSize=10,
-                    textColor=colors.HexColor('#8b949e'),
-                )
-            ))
-            story.append(Spacer(1, 10))
-            
-            fft_image = self._generate_fft_graph(records)
-            if fft_image:
-                story.append(fft_image)
-        
-        # Frequency Spectrum Analysis (if enabled)
-        if self.include_harmonic_analysis:
-            story.append(PageBreak())
-            story.append(Paragraph("Frequency Spectrum Analysis", section_style))
-            story.append(Spacer(1, 5))
-            
-            # Perform frequency spectrum analysis
-            signal_name = self.harmonic_signal.capitalize()
-            signal_unit = {"voltage": "V", "current": "A", "power": "W"}.get(self.harmonic_signal, "")
-            analyzer = HarmonicAnalyzer(max_harmonics=self.harmonic_max_order)
-            harmonic_result = analyzer.analyze_signal(records, self.harmonic_signal, max_display_freq=25.0)
-            
-            if harmonic_result:
-                # Add description
-                story.append(Paragraph(
-                    f"Frequency spectrum analysis of {signal_name.lower()} signal. "
-                    f"Shows dominant frequencies in the signal variations and overall modulation characteristics.",
-                    ParagraphStyle(
-                        name='HarmonicInfo',
-                        parent=styles['Normal'],
-                        fontSize=10,
-                        textColor=colors.HexColor('#8b949e'),
-                    )
-                ))
-                story.append(Spacer(1, 10))
-                
-                # Spectrum Summary Table
-                thd_data = [
-                    ["Metric", "Value"],
-                    ["Dominant Frequency", f"{harmonic_result.fundamental_freq:.2f} Hz"],
-                    ["Dominant Amplitude", f"{harmonic_result.fundamental_amplitude:.4f} {signal_unit}"],
-                    ["Modulation Depth", f"{harmonic_result.thd_percent:.2f}%"],
-                ]
-                
-                thd_table = Table(thd_data, colWidths=[150, 200])
-                thd_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#58a6ff')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 10),
-                    ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-                    ('ALIGN', (1, 0), (1, -1), 'LEFT'),
-                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#30363d')),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f6f8fa')]),
-                    ('TOPPADDING', (0, 0), (-1, -1), 8),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                ]))
-                story.append(thd_table)
-                story.append(Spacer(1, 15))
-                
-                # Frequency spectrum graph
-                harmonic_graph = self._generate_harmonic_graph(harmonic_result, signal_name, records)
-                if harmonic_graph:
-                    story.append(harmonic_graph)
-            else:
-                story.append(Paragraph(
-                    f"⚠ Frequency spectrum analysis could not be performed on {signal_name.lower()} signal.",
-                    ParagraphStyle(name='Warning', parent=styles['Normal'], 
-                                  fontSize=11, textColor=colors.HexColor('#f85149'), 
-                                  fontName='Helvetica-Bold')
-                ))
-                story.append(Spacer(1, 8))
-                story.append(Paragraph(
-                    "Possible reasons:<br/>"
-                    "• Signal is too constant - requires measurable variations for spectrum analysis<br/>"
-                    "• Signal amplitude is too low (&lt; 0.1mV/mA/mW)<br/>"
-                    "• Insufficient data points (&lt; 100 samples)<br/>"
-                    "<br/>"
-                    "Suggestions:<br/>"
-                    "• Ensure the system has dynamic load variations<br/>"
-                    "• Increase measurement duration for better frequency resolution<br/>"
-                    "• Try analyzing 'current' signal for switching power supplies",
-                    ParagraphStyle(name='WarningDetails', parent=styles['Normal'], 
-                                  fontSize=9, textColor=colors.HexColor('#8b949e'),
-                                  leftIndent=20, bulletIndent=10)
-                ))
-        
-        # Power Supply Quality Analysis (for DC systems)
-        if self.include_psu_analysis:
-            story.append(PageBreak())
-            story.append(Paragraph("Power Supply Quality Analysis", section_style))
-            story.append(Spacer(1, 5))
-            
-            # Perform PSU quality analysis
-            psu_analyzer = PowerSupplyAnalyzer()
-            psu_quality = psu_analyzer.analyze_voltage_quality(records, self.nominal_voltage)
-            
-            if psu_quality:
-                # Add description
-                story.append(Paragraph(
-                    "DC power supply quality metrics including voltage regulation, ripple, "
-                    "and load regulation analysis. These metrics help evaluate if the power "
-                    "supply meets the requirements for your application.",
-                    ParagraphStyle(
-                        name='PSUInfo',
-                        parent=styles['Normal'],
-                        fontSize=10,
-                        textColor=colors.HexColor('#8b949e'),
-                    )
-                ))
-                story.append(Spacer(1, 10))
-                
-                # Quality Summary Table
-                psu_data = [
-                    ["Metric", "Value", "Status"],
-                    ["Nominal Voltage", f"{psu_quality.nominal_voltage:.3f} V", ""],
-                    ["Voltage Range", f"{psu_quality.min_voltage:.3f} - {psu_quality.max_voltage:.3f} V", ""],
-                    ["Voltage Ripple (p-p)", f"{psu_quality.voltage_ripple_mv:.2f} mV ({psu_quality.voltage_ripple_percent:.3f}%)", ""],
-                    ["RMS Noise", f"{psu_quality.rms_noise*1000:.2f} mV", ""],
-                    ["Stability Rating", psu_quality.stability_rating, self._get_rating_symbol(psu_quality.stability_rating)],
-                ]
-                
-                if psu_quality.load_regulation_percent is not None:
-                    psu_data.append(["Load Regulation", f"{psu_quality.load_regulation_percent:.3f}%", ""])
-                if psu_quality.settling_time_ms is not None:
-                    psu_data.append(["Settling Time", f"{psu_quality.settling_time_ms:.1f} ms", ""])
-                
-                psu_table = Table(psu_data, colWidths=[150, 150, 80])
-                psu_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#58a6ff')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 10),
-                    ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-                    ('ALIGN', (1, 0), (1, -1), 'LEFT'),
-                    ('ALIGN', (2, 0), (2, -1), 'CENTER'),
-                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#30363d')),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f6f8fa')]),
-                    ('TOPPADDING', (0, 0), (-1, -1), 8),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                ]))
-                story.append(psu_table)
-                story.append(Spacer(1, 15))
-                
-                # Compliance Check
-                story.append(Paragraph("Specification Compliance", 
-                                      ParagraphStyle(name='PSUCompliance', parent=styles['Heading3'], 
-                                                    fontSize=12, textColor=colors.HexColor('#58a6ff'))))
-                story.append(Spacer(1, 8))
-                
-                compliance_data = [
-                    ["Specification", "Requirement", "Status"],
-                    ["Precision PSU", "< 0.05% ripple", "✓ Pass" if psu_quality.meets_005percent_spec else "✗ Fail"],
-                    ["Linear PSU", "< 0.1% ripple", "✓ Pass" if psu_quality.meets_01percent_spec else "✗ Fail"],
-                    ["Switching PSU", "< 1% ripple", "✓ Pass" if psu_quality.meets_1percent_spec else "✗ Fail"],
-                ]
-                
-                compliance_table = Table(compliance_data, colWidths=[150, 120, 110])
-                compliance_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#58a6ff')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 10),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#30363d')),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f6f8fa')]),
-                    ('TOPPADDING', (0, 0), (-1, -1), 8),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                ]))
-                story.append(compliance_table)
-                story.append(Spacer(1, 15))
-                
-                # Recommendations
-                recommendations = PowerSupplyAnalyzer.get_quality_recommendations(psu_quality)
-                if recommendations:
-                    story.append(Paragraph("Recommendations", 
-                                          ParagraphStyle(name='PSURecommendations', parent=styles['Heading3'], 
-                                                        fontSize=12, textColor=colors.HexColor('#58a6ff'))))
-                    story.append(Spacer(1, 8))
-                    
-                    for rec in recommendations:
-                        story.append(Paragraph(
-                            rec,
-                            ParagraphStyle(name='Recommendation', parent=styles['Normal'], 
-                                          fontSize=10, leftIndent=10, bulletIndent=5)
-                        ))
-                        story.append(Spacer(1, 3))
-        
-        # Footer
-        story.append(Spacer(1, 30))
-        story.append(Paragraph(
-            f"Generated by {APP_NAME} v{__version__}",
-            ParagraphStyle(
-                name='Footer',
-                parent=styles['Normal'],
-                fontSize=8,
-                textColor=colors.HexColor('#8b949e'),
-                alignment=TA_CENTER,
-            )
-        ))
-        
-        doc.build(story)
-    
-    @staticmethod
-    def _format_duration(seconds: float) -> str:
-        """Format duration in human-readable format."""
-        if seconds < 60:
-            return f"{seconds:.1f} seconds"
-        elif seconds < 3600:
-            return f"{seconds / 60:.1f} minutes"
+        story.append(Paragraph(tr("Measurements over time"), h2))
+        width, height = 170 * mm, 60 * mm
+        mk = [(m.t - t0, m.label) for m in markers]
+        for name, unit, col, color in ((tr("Voltage"), "V", v, COLOR_V),
+                                       (tr("Current"), "A", i, COLOR_I),
+                                       (tr("Power"), "W", p, COLOR_P)):
+            subtitle = tr("min {min}   average {avg}   max {max}", min=format_si(float(col.min()), unit),
+                          avg=format_si(float(col.mean()), unit), max=format_si(float(col.max()), unit))
+            story.append(_time_chart(s.t, col, name, unit, color, width, height, mk, subtitle))
+            story.append(Spacer(1, 4))
+        story.append(Paragraph(_esc(tr(
+            "Shaded band: minimum and maximum within each plotted point (spikes are preserved). "
+            "Dashed line: average.")), muted))
+        story.append(KeepTogether([
+            Paragraph(tr("Power distribution"), h2),
+            _histogram_chart(p, 170 * mm, 55 * mm),
+            Spacer(1, 4),
+            table([[tr("Percentile"), "1 %", "5 %", "50 %", "95 %", "99 %"],
+                   [tr("Power")] + [format_si(float(np.percentile(p, q)), "W")
+                                    for q in (1, 5, 50, 95, 99)]],
+                  [30 * mm] + [28 * mm] * 5),
+            Spacer(1, 3),
+            Paragraph(_esc(tr("How long the device spent at each power level; separate peaks "
+                              "reveal distinct operating states (idle, active, bursts).")), muted),
+        ]))
+        step(0.5)
+
+    # --- power supply quality
+    if options.include_psu:
+        q = PowerSupplyAnalyzer().analyze_voltage_quality(s)
+        if q is not None:
+            rows = [
+                [tr("Metric"), tr("Value")],
+                [tr("Nominal voltage"), format_si(q.nominal_voltage, "V")],
+                [tr("Voltage range"), f"{format_si(q.min_voltage, 'V')} - {format_si(q.max_voltage, 'V')}"],
+                [tr("Ripple (peak-to-peak)"), f"{format_si(q.voltage_ripple_mv / 1000, 'V')}  ({q.voltage_ripple_percent:.3f} %)"],
+                [tr("RMS noise"), format_si(q.rms_noise, "V")],
+                [tr("Stability rating"), rating_label(q.stability_rating)],
+            ]
+            if q.load_regulation_percent is not None:
+                rows.append([tr("Load regulation"), f"{q.load_regulation_percent:.3f} %"])
+            if q.settling_time_ms is not None:
+                rows.append([tr("Settling time"), f"{q.settling_time_ms:.1f} ms"])
+            ok, ko = tr("Pass"), tr("Fail")
+            comp = [
+                [tr("Class"), tr("Requirement"), tr("Result")],
+                [tr("Precision supply"), "< 0.05 %", ok if q.meets_005percent_spec else ko],
+                [tr("Linear supply"), "< 0.1 %", ok if q.meets_01percent_spec else ko],
+                [tr("Switching supply"), "< 1 %", ok if q.meets_1percent_spec else ko],
+            ]
+            block = [Paragraph(tr("Power supply quality"), h2), table(rows, [70 * mm, 80 * mm]),
+                     Spacer(1, 6), table(comp, [60 * mm, 45 * mm, 45 * mm]), Spacer(1, 6)]
+            for rec in PowerSupplyAnalyzer.get_quality_recommendations(q):
+                block.append(Paragraph("• " + _esc(rec), body))
+            block.append(Spacer(1, 3))
+            block.append(Paragraph(_esc(tr(
+                "Ripple is measured at the INA226 sample rate: faster switching ripple is "
+                "averaged out by the sensor and does not appear here.")), muted))
+            story.append(KeepTogether(block))
+        step(0.7)
+
+    # --- spectrum
+    if options.include_spectrum:
+        sig = options.spectrum_signal
+        unit = {"voltage": "V", "current": "A", "power": "W"}.get(sig, "")
+        label = {"voltage": tr("Voltage"), "current": tr("Current"), "power": tr("Power")}.get(sig, sig)
+        res = analyze_spectrum(s, sig)
+        story.append(PageBreak())
+        story.append(Paragraph(tr("Frequency spectrum ({signal})", signal=label.lower()), h2))
+        if res is None:
+            story.append(Paragraph(_esc(tr(
+                "Spectrum not available: at least 64 samples with some variation are required.")), body))
         else:
-            return f"{seconds / 3600:.2f} hours"
-    
-    def _generate_graphs(self, records: List[MeasurementRecord]) -> list:
-        """Generate graphs for voltage, current, and power.
-        
-        Args:
-            records: List of measurement records
-            
-        Returns:
-            List of reportlab Image objects
-        """
-        import matplotlib
-        matplotlib.use('Agg')  # Non-interactive backend
-        import matplotlib.pyplot as plt
-        from reportlab.platypus import Image
-        from reportlab.lib.units import mm
-        
-        # Downsample if too many points (for performance)
-        MAX_GRAPH_POINTS = 2000
-        if len(records) > MAX_GRAPH_POINTS:
-            step = len(records) // MAX_GRAPH_POINTS
-            records = records[::step]
-        
-        # Extract data - use relative_time for X axis (starts from 0)
-        times = [r.relative_time for r in records]
-        voltages = [r.voltage for r in records]
-        currents = [r.current for r in records]
-        powers = [r.power for r in records]
-        
-        # Graph settings (mm -> inches for matplotlib figsize; must NOT also
-        # multiply by reportlab's `mm` unit, which is already points-per-mm
-        # and is only meant for point-based layout sizes like the Image() call
-        # below - combining both inflated every chart to ~2.83x too large)
-        fig_width = 170 / 25.4  # Convert mm to inches
-        fig_height = 70 / 25.4  # Slightly taller for better readability
-        
-        images = []
-        
-        # Define graph configurations - darker, more visible colors
-        graphs = [
-            ('Voltage [V]', voltages, '#1f77b4', '#0d3d6e'),  # Blue
-            ('Current [A]', currents, '#d62728', '#8b1a1a'),  # Red
-            ('Power [W]', powers, '#2ca02c', '#1a5c1a'),      # Green
-        ]
-        
-        for title, data, line_color, fill_color in graphs:
-            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-            
-            # Set white background
-            ax.set_facecolor('white')
-            fig.patch.set_facecolor('white')
-            
-            # Thicker line for better visibility
-            ax.plot(times, data, color=line_color, linewidth=1.5)
-            ax.fill_between(times, data, alpha=0.3, color=fill_color)
-            
-            ax.set_ylabel(title, fontsize=11, fontweight='bold')
-            ax.set_xlabel('Time [s]', fontsize=10)
-            ax.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
-            
-            # Format x-axis based on duration (in seconds from 0)
-            duration = times[-1] - times[0] if times else 0
-            if duration > 3600:
-                # Show in minutes for long recordings
-                ax.set_xlabel('Time [min]', fontsize=10)
-                ax.set_xticks([t for t in range(0, int(duration) + 1, int(duration / 10) or 1)])
-                ax.set_xticklabels([f'{t/60:.1f}' for t in ax.get_xticks()])
-            
-            plt.xticks(fontsize=9)
-            plt.yticks(fontsize=9)
-            
-            # Add min/max/avg annotations
-            min_val = min(data)
-            max_val = max(data)
-            avg_val = sum(data) / len(data)
-            
-            # Average line - more visible
-            ax.axhline(y=avg_val, color=line_color, linestyle='--', alpha=0.7, linewidth=1.2)
-            
-            # Stats box with better formatting
-            stats_text = f'Min: {min_val:.4f}  |  Max: {max_val:.4f}  |  Avg: {avg_val:.4f}'
-            ax.text(
-                0.02, 0.95, 
-                stats_text,
-                transform=ax.transAxes,
-                fontsize=9,
-                fontweight='bold',
-                verticalalignment='top',
-                bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
-                         edgecolor=line_color, alpha=0.9, linewidth=1.5)
-            )
-            
-            # Add some padding to y-axis
-            y_range = max_val - min_val
-            if y_range > 0:
-                ax.set_ylim(min_val - y_range * 0.1, max_val + y_range * 0.15)
-            
-            plt.tight_layout()
-            
-            # Save to buffer - higher DPI for better quality
-            buf = BytesIO()
-            fig.savefig(buf, format='png', dpi=200, bbox_inches='tight', 
-                       facecolor='white', edgecolor='none')
-            buf.seek(0)
-            plt.close(fig)
-            
-            # Create reportlab Image
-            img = Image(buf, width=170*mm, height=70*mm)
-            images.append(img)
-        
-        return images
-    
-    def _generate_fft_graph(self, records: List[MeasurementRecord]):
-        """Generate FFT spectrum analysis of current signal.
-        
-        Args:
-            records: List of measurement records
-            
-        Returns:
-            reportlab Image object or None if insufficient data
-        """
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        import numpy as np
-        from reportlab.platypus import Image
-        from reportlab.lib.units import mm
-        
-        if len(records) < 64:
-            return None  # Need enough samples for meaningful FFT
-        
-        # Extract current data
-        currents = np.array([r.current for r in records])
-        times = np.array([r.relative_time for r in records])
-        
-        # Calculate sampling rate
-        dt = np.mean(np.diff(times))
-        if dt <= 0:
-            return None
-        fs = 1.0 / dt  # Sampling frequency
-        
-        # Remove DC component (mean)
-        currents_ac = currents - np.mean(currents)
-        
-        # Apply window to reduce spectral leakage
-        window = np.hanning(len(currents_ac))
-        currents_windowed = currents_ac * window
-        
-        # Compute FFT
-        n = len(currents_windowed)
-        fft_result = np.fft.rfft(currents_windowed)
-        freqs = np.fft.rfftfreq(n, dt)
-        
-        # Compute magnitude spectrum (in dB relative to max)
-        magnitude = np.abs(fft_result) * 2 / n  # Scale for single-sided spectrum
-        
-        # Avoid log of zero
-        magnitude[magnitude < 1e-10] = 1e-10
-        magnitude_db = 20 * np.log10(magnitude / np.max(magnitude))
-        
-        # Create figure (mm -> inches; see note in _generate_graphs)
-        fig_width = 170 / 25.4
-        fig_height = 90 / 25.4
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(fig_width, fig_height))
-        fig.patch.set_facecolor('white')
-        
-        # Plot 1: Linear frequency spectrum
-        ax1.set_facecolor('white')
-        ax1.plot(freqs, magnitude * 1000, color='#d62728', linewidth=1.2)  # mA
-        ax1.fill_between(freqs, magnitude * 1000, alpha=0.3, color='#d62728')
-        ax1.set_xlabel('Frequency [Hz]', fontsize=10)
-        ax1.set_ylabel('Amplitude [mA]', fontsize=10)
-        ax1.set_title('Current Spectrum (Linear)', fontsize=11, fontweight='bold')
-        ax1.grid(True, alpha=0.4)
-        ax1.set_xlim(0, min(fs/2, 1000))  # Limit to 1kHz or Nyquist
-        
-        # Plot 2: Log frequency spectrum (dB)
-        ax2.set_facecolor('white')
-        ax2.plot(freqs, magnitude_db, color='#1f77b4', linewidth=1.2)
-        ax2.fill_between(freqs, magnitude_db, -100, alpha=0.3, color='#1f77b4')
-        ax2.set_xlabel('Frequency [Hz]', fontsize=10)
-        ax2.set_ylabel('Magnitude [dB]', fontsize=10)
-        ax2.set_title('Current Spectrum (Logarithmic)', fontsize=11, fontweight='bold')
-        ax2.grid(True, alpha=0.4)
-        ax2.set_xlim(0, min(fs/2, 1000))
-        ax2.set_ylim(-80, 5)
-        
-        # Find and annotate dominant frequencies
-        # Skip DC (index 0) and find peaks
-        peak_threshold = -30  # dB
-        peaks_idx = []
-        for i in range(1, len(magnitude_db) - 1):
-            if (magnitude_db[i] > magnitude_db[i-1] and 
-                magnitude_db[i] > magnitude_db[i+1] and
-                magnitude_db[i] > peak_threshold):
-                peaks_idx.append(i)
-        
-        # Annotate top 5 peaks
-        peak_mags = [(i, magnitude_db[i]) for i in peaks_idx]
-        peak_mags.sort(key=lambda x: x[1], reverse=True)
-        
-        peak_info = []
-        for i, (idx, mag) in enumerate(peak_mags[:5]):
-            freq = freqs[idx]
-            if freq > 1:  # Skip very low frequencies
-                ax2.annotate(
-                    f'{freq:.1f} Hz',
-                    xy=(freq, mag),
-                    xytext=(5, 10),
-                    textcoords='offset points',
-                    fontsize=8,
-                    color='#1f77b4',
-                    fontweight='bold'
-                )
-                peak_info.append(f'{freq:.1f} Hz')
-        
-        # Add info box
-        info_text = f'Sampling: {fs:.1f} Hz | Nyquist: {fs/2:.1f} Hz'
-        if peak_info:
-            info_text += f'\nDominant: {", ".join(peak_info[:3])}'
-        
-        ax1.text(
-            0.98, 0.95, info_text,
-            transform=ax1.transAxes,
-            fontsize=8,
-            verticalalignment='top',
-            horizontalalignment='right',
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
-                     edgecolor='#d62728', alpha=0.9)
-        )
-        
-        plt.tight_layout()
-        
-        # Save to buffer
-        buf = BytesIO()
-        fig.savefig(buf, format='png', dpi=200, bbox_inches='tight',
-                   facecolor='white', edgecolor='none')
-        buf.seek(0)
-        plt.close(fig)
-        
-        return Image(buf, width=170*mm, height=90*mm)
-    
-    @staticmethod
-    def _get_rating_symbol(rating: str) -> str:
-        """Get symbol for stability rating."""
-        symbols = {
-            "Excellent": "✓✓",
-            "Good": "✓",
-            "Fair": "~",
-            "Poor": "✗"
-        }
-        return symbols.get(rating, "")
-    
-    def _generate_harmonic_graph(self, harmonic_result, signal_name: str, records: List[MeasurementRecord] = None):
-        """Generate comprehensive frequency spectrum analysis graphs.
-        
-        Args:
-            harmonic_result: HarmonicAnalysis object
-            signal_name: Name of signal (e.g., "Current")
-            records: Optional measurement records for waveform plot
-            
-        Returns:
-            reportlab Image object or None
-        """
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            import numpy as np
-            from reportlab.platypus import Image
-            from reportlab.lib.units import mm
-            
-            # Create figure with 4 subplots
-            fig = plt.figure(figsize=(10, 10))
-            gs = fig.add_gridspec(3, 2, hspace=0.35, wspace=0.3)
-            
-            # 1. Signal Waveform (top, full width)
-            ax_wave = fig.add_subplot(gs[0, :])
-            if records and len(records) > 0:
-                # Extract signal
-                times = np.array([r.relative_time for r in records])
-                if signal_name.lower() == 'current':
-                    signal = np.array([r.current for r in records])
-                    unit = 'A'
-                elif signal_name.lower() == 'voltage':
-                    signal = np.array([r.voltage for r in records])
-                    unit = 'V'
-                else:
-                    signal = np.array([r.power for r in records])
-                    unit = 'W'
-                
-                # Downsample if too many points
-                if len(times) > 2000:
-                    step = len(times) // 2000
-                    times = times[::step]
-                    signal = signal[::step]
-                
-                ax_wave.plot(times, signal, color='#58a6ff', linewidth=1.5, alpha=0.8)
-                ax_wave.set_xlabel('Time (s)', fontsize=10, fontweight='bold')
-                ax_wave.set_ylabel(f'{signal_name} ({unit})', fontsize=10, fontweight='bold')
-                ax_wave.set_title(f'{signal_name} Waveform', fontsize=11, fontweight='bold')
-                ax_wave.grid(True, alpha=0.3, linestyle='--')
-            else:
-                ax_wave.text(0.5, 0.5, 'Waveform data not available', 
-                           ha='center', va='center', fontsize=10)
-                ax_wave.set_xticks([])
-                ax_wave.set_yticks([])
-            
-            # 2. Harmonic Bar Chart (middle left)
-            ax_bar = fig.add_subplot(gs[1, 0])
-            orders = [h.order for h in harmonic_result.harmonics]
-            amplitudes = [h.amplitude for h in harmonic_result.harmonics]
-            colors_list = ['#58a6ff' if o == 1 else '#f85149' for o in orders]
-            
-            bars = ax_bar.bar(orders, amplitudes, color=colors_list, alpha=0.8, 
-                            edgecolor='black', linewidth=0.5)
-            ax_bar.set_xlabel('Harmonic Order', fontsize=10, fontweight='bold')
-            ax_bar.set_ylabel('Amplitude', fontsize=10, fontweight='bold')
-            ax_bar.set_title('Harmonic Amplitudes', fontsize=11, fontweight='bold')
-            ax_bar.grid(True, alpha=0.3, linestyle='--', axis='y')
-            ax_bar.set_xticks(orders)
-            
-            # Add value labels on significant bars
-            for bar, amp in zip(bars, amplitudes):
-                if amp > max(amplitudes) * 0.1:  # Only label significant harmonics
-                    height = bar.get_height()
-                    ax_bar.text(bar.get_x() + bar.get_width()/2., height,
-                              f'{amp:.3f}',
-                              ha='center', va='bottom', fontsize=7)
-            
-            # 3. Percentage with IEC limits (middle right)
-            ax_pct = fig.add_subplot(gs[1, 1])
-            percentages = [h.percentage for h in harmonic_result.harmonics]
-            
-            if len(orders) > 1:  # Only plot if we have harmonics beyond fundamental
-                ax_pct.bar(orders[1:], percentages[1:], color='#f85149', alpha=0.8, 
-                         edgecolor='black', linewidth=0.5, label='Measured')
-                
-                # Add IEC limits
-                iec_limits = HarmonicAnalyzer.get_harmonic_limits_iec()
-                limit_orders = []
-                limit_values = []
-                for order, limit in iec_limits.items():
-                    if order in orders[1:]:
-                        limit_orders.append(order)
-                        limit_values.append(limit)
-                
-                if limit_orders:
-                    ax_pct.plot(limit_orders, limit_values, 'o--', color='#3fb950', 
-                              linewidth=2, markersize=6, alpha=0.8, label='IEC Limit')
-                
-                ax_pct.set_xlabel('Harmonic Order', fontsize=10, fontweight='bold')
-                ax_pct.set_ylabel('% of Fundamental', fontsize=10, fontweight='bold')
-                ax_pct.set_title('Harmonic Distortion', fontsize=11, fontweight='bold')
-                ax_pct.grid(True, alpha=0.3, linestyle='--')
-                ax_pct.set_xticks(orders[1:])
-                ax_pct.legend(loc='upper right', fontsize=8)
-                
-                # Add value labels
-                for order, pct in zip(orders[1:], percentages[1:]):
-                    if pct > max(percentages[1:]) * 0.1:
-                        ax_pct.text(order, pct, f'{pct:.1f}%',
-                                  ha='center', va='bottom', fontsize=7)
-            else:
-                ax_pct.text(0.5, 0.5, 'No harmonics detected', 
-                          ha='center', va='center', fontsize=10)
-                ax_pct.set_xticks([])
-                ax_pct.set_yticks([])
-            
-            # 4. Full FFT Spectrum (bottom, full width)
-            ax_fft = fig.add_subplot(gs[2, :])
-            if harmonic_result.frequencies is not None and harmonic_result.magnitudes is not None:
-                # Plot full spectrum
-                freqs = harmonic_result.frequencies
-                mags = harmonic_result.magnitudes
-                
-                # Limit to reasonable frequency range for visibility
-                max_freq = min(1000, harmonic_result.fundamental_freq * 20)
-                mask = freqs <= max_freq
-                
-                ax_fft.plot(freqs[mask], mags[mask], color='#8b949e', linewidth=1, alpha=0.6)
-                ax_fft.fill_between(freqs[mask], mags[mask], alpha=0.2, color='#58a6ff')
-                
-                # Mark harmonic frequencies
-                for h in harmonic_result.harmonics[:10]:  # First 10 harmonics
-                    ax_fft.axvline(h.frequency, color='#f85149', linestyle='--', 
-                                 linewidth=1, alpha=0.5)
-                    if h.order <= 5:  # Label first 5
-                        ax_fft.text(h.frequency, max(mags[mask]) * 0.9, f'{h.order}',
-                                  ha='center', fontsize=8, color='#f85149', fontweight='bold')
-                
-                ax_fft.set_xlabel('Frequency (Hz)', fontsize=10, fontweight='bold')
-                ax_fft.set_ylabel('Magnitude', fontsize=10, fontweight='bold')
-                ax_fft.set_title(f'Full FFT Spectrum (Fundamental: {harmonic_result.fundamental_freq:.2f} Hz)', 
-                               fontsize=11, fontweight='bold')
-                ax_fft.grid(True, alpha=0.3, linestyle='--')
-                ax_fft.set_xlim(0, max_freq)
-            else:
-                ax_fft.text(0.5, 0.5, 'FFT spectrum not available', 
-                          ha='center', va='center', fontsize=10)
-                ax_fft.set_xticks([])
-                ax_fft.set_yticks([])
-            
-            plt.suptitle(f'Frequency Spectrum Analysis - {signal_name}', fontsize=13, fontweight='bold', y=0.995)
-            
-            # Save to buffer
-            buf = BytesIO()
-            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight',
-                       facecolor='white', edgecolor='none')
-            buf.seek(0)
-            plt.close(fig)
-            
-            return Image(buf, width=180*mm, height=180*mm)
+            story.append(Paragraph(_esc(tr(
+                "Where the load variation energy is concentrated. Resolution {res}, Nyquist limit {nyq}.",
+                res=f"{res.resolution_hz:.3g} Hz", nyq=f"{res.sample_rate / 2:.1f} Hz")), muted))
+            story.append(_spectrum_chart(res.frequencies, res.amplitudes, unit, 170 * mm, 62 * mm))
+            story.append(Spacer(1, 4))
+            story.append(_spectrum_chart(res.frequencies, res.amplitudes, unit, 170 * mm, 62 * mm,
+                                         db=True))
+            prow = [[tr("Frequency"), tr("Amplitude"), tr("Period")]]
+            prow += [[f"{pk.frequency:.3f} Hz", format_si(pk.amplitude, unit),
+                      format_si(1.0 / pk.frequency, "s") if pk.frequency > 0 else "-"]
+                     for pk in res.peaks]
+            prow.append([tr("Modulation depth"), f"{res.modulation_percent:.2f} %", ""])
+            story.append(Spacer(1, 6))
+            story.append(table(prow, [50 * mm, 50 * mm, 40 * mm]))
+        step(0.85)
 
-        except Exception as e:
-            print(f"[WARNING] Failed to generate harmonic graph: {e}")
-            return None
+    # --- device and calibration
+    if options.device:
+        story.append(KeepTogether([
+            Paragraph(tr("Instrument settings"), h2),
+            table([[k, val] for k, val in options.device.items()], [70 * mm, 80 * mm],
+                  header=False, align_right_from=2),
+        ]))
 
+    def on_page(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.HexColor(MUTED))
+        canvas.drawString(20 * mm, 10 * mm, f"{APP_NAME} {__version__}  -  {title}"[:110])
+        canvas.drawRightString(A4[0] - 20 * mm, 10 * mm, tr("Page {n}", n=doc.page))
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(str(path), pagesize=A4, leftMargin=20 * mm, rightMargin=20 * mm,
+                            topMargin=18 * mm, bottomMargin=18 * mm, title=title, author=APP_NAME)
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+    step(1.0)
+    return stats
+
+
+def _benchmark_result(s: Samples, bench: Optional[tuple]):
+    """Benchmark figures if the benchmark range lies within the exported data."""
+    if not bench:
+        return None
+    from ..core.benchmark import compute
+    inp, (b0, b1), _label = bench
+    if len(s) < 2 or b0 < float(s.t[0]) - 1e-6 or b1 > float(s.t[-1]) + 1e-6:
+        return None
+    return compute(Statistics.from_samples(s.between(b0, b1)), inp)
+
+
+def _esc(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ------------------------------------------------------------------ charts
+
+def _nice_ticks(lo: float, hi: float, target: int = 5) -> List[float]:
+    if not math.isfinite(lo) or not math.isfinite(hi):
+        return []
+    if hi <= lo:
+        hi = lo + 1.0
+    raw = (hi - lo) / target
+    mag = 10 ** math.floor(math.log10(raw))
+    for m in (1, 2, 2.5, 5, 10):
+        if m * mag >= raw:
+            step = m * mag
+            break
+    first = math.ceil(lo / step) * step
+    ticks = []
+    x = first
+    while x <= hi + step * 1e-9:
+        ticks.append(round(x, 12))
+        x += step
+    return ticks
+
+
+def envelope(t: np.ndarray, y: np.ndarray, buckets: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Min/max per time bucket so spikes survive downsampling."""
+    n = len(t)
+    if n <= buckets * 2:
+        return t, y, y
+    edges = np.linspace(0, n, buckets + 1).astype(int)
+    idx = edges[:-1]
+    mins = np.minimum.reduceat(y, idx)
+    maxs = np.maximum.reduceat(y, idx)
+    centers = t[np.minimum(idx + np.diff(edges) // 2, n - 1)]
+    return centers, mins, maxs
+
+
+def _axis_scale(values: np.ndarray, unit: str) -> Tuple[float, str]:
+    """Pick an SI prefix for an axis from the largest magnitude shown."""
+    peak = float(np.nanmax(np.abs(values))) if len(values) else 0.0
+    for factor, prefix in ((1.0, ""), (1e-3, "m"), (1e-6, "µ")):
+        if peak >= factor or factor == 1e-6:
+            return factor, prefix + unit
+    return 1.0, unit
+
+
+def _frame(width: float, height: float):
+    from reportlab.graphics.shapes import Drawing
+    d = Drawing(width, height)
+    left, bottom, right, top = 46, 26, width - 8, height - 16
+    return d, (left, bottom, right, top)
+
+
+def _draw_axes(d, box, xticks, yticks, x2px, y2px, xfmt, yfmt, xlabel, ylabel, title, color):
+    from reportlab.graphics.shapes import Line, String
+    from reportlab.lib import colors
+    left, bottom, right, top = box
+    grid = colors.HexColor(GRID)
+    ink = colors.HexColor(MUTED)
+    for yt in yticks:
+        y = y2px(yt)
+        if bottom - 0.5 <= y <= top + 0.5:
+            d.add(Line(left, y, right, y, strokeColor=grid, strokeWidth=0.5))
+            d.add(String(left - 4, y - 3, yfmt(yt), fontName="Helvetica", fontSize=7,
+                         fillColor=ink, textAnchor="end"))
+    for xt in xticks:
+        x = x2px(xt)
+        if left - 0.5 <= x <= right + 0.5:
+            d.add(Line(x, bottom, x, top, strokeColor=grid, strokeWidth=0.5))
+            d.add(String(x, bottom - 10, xfmt(xt), fontName="Helvetica", fontSize=7,
+                         fillColor=ink, textAnchor="middle"))
+    d.add(Line(left, bottom, right, bottom, strokeColor=ink, strokeWidth=0.6))
+    d.add(String(left, top + 5, title, fontName="Helvetica-Bold", fontSize=9,
+                 fillColor=colors.HexColor(color)))
+    d.add(String(right, bottom - 21, xlabel, fontName="Helvetica", fontSize=7,
+                 fillColor=ink, textAnchor="end"))
+    d.add(String(right, top + 5, ylabel, fontName="Helvetica", fontSize=7,
+                 fillColor=ink, textAnchor="end"))
+
+
+MARKER_COLOR = "#c2410c"
+
+
+def _time_chart(t: np.ndarray, y: np.ndarray, name: str, unit: str, color: str,
+                width: float, height: float, markers: Sequence[Tuple[float, str]] = (),
+                subtitle: str = ""):
+    from reportlab.graphics.shapes import Line, PolyLine, Polygon, String
+    from reportlab.lib import colors
+
+    d, box = _frame(width, height)
+    left, bottom, right, top = box
+    if len(t) < 2:
+        return d
+    factor, yunit = _axis_scale(y, unit)
+    ys = y / factor
+    duration = float(t[-1] - t[0])
+    if duration >= 7200:
+        tdiv, tunit = 3600.0, "h"
+    elif duration >= 180:
+        tdiv, tunit = 60.0, "min"
+    else:
+        tdiv, tunit = 1.0, "s"
+    ts = (t - t[0]) / tdiv
+
+    cx, lo, hi = envelope(ts, ys, int(right - left))
+    ymin, ymax = float(np.min(lo)), float(np.max(hi))
+    pad = (ymax - ymin) * 0.08 or max(abs(ymax) * 0.01, 1e-9)
+    ymin, ymax = ymin - pad, ymax + pad
+    xmax = float(ts[-1]) or 1.0
+
+    def x2px(x):
+        return left + (x / xmax) * (right - left)
+
+    def y2px(v):
+        return bottom + (v - ymin) / (ymax - ymin) * (top - bottom)
+
+    yt = _nice_ticks(ymin, ymax, 4)
+    _draw_axes(d, box, _nice_ticks(0, xmax, 8), yt, x2px, y2px,
+               lambda v: f"{v:g}", lambda v: f"{v:.4g}",
+               tr("Time [{unit}]", unit=tunit), f"[{yunit}]", name, color)
+
+    stroke = colors.HexColor(color)
+    if len(cx) < len(ts):
+        # Shaded min/max band plus the mid line.
+        pts = [c for x, v in zip(cx, hi) for c in (x2px(x), y2px(v))]
+        pts += [c for x, v in zip(cx[::-1], lo[::-1]) for c in (x2px(x), y2px(v))]
+        fill = colors.Color(stroke.red, stroke.green, stroke.blue, alpha=0.35)
+        d.add(Polygon(pts, fillColor=fill, strokeColor=None, strokeWidth=0))
+        mid = (lo + hi) / 2
+        d.add(PolyLine([c for x, v in zip(cx, mid) for c in (x2px(x), y2px(v))],
+                       strokeColor=stroke, strokeWidth=0.6))
+    else:
+        d.add(PolyLine([c for x, v in zip(cx, lo) for c in (x2px(x), y2px(v))],
+                       strokeColor=stroke, strokeWidth=0.9))
+    avg = float(np.mean(ys))
+    d.add(Line(left, y2px(avg), right, y2px(avg), strokeColor=stroke, strokeWidth=0.5,
+               strokeDashArray=[3, 2]))
+    mcolor = colors.HexColor(MARKER_COLOR)
+    for mt, mlabel in markers:
+        x = x2px(mt / tdiv)
+        if left <= x <= right:
+            d.add(Line(x, bottom, x, top, strokeColor=mcolor, strokeWidth=0.7,
+                       strokeDashArray=[2, 2]))
+            d.add(String(x + 2, top - 8, mlabel[:24], fontName="Helvetica", fontSize=6.5,
+                         fillColor=mcolor))
+    if subtitle:
+        d.add(String(left + 70, top + 5, subtitle, fontName="Helvetica", fontSize=7,
+                     fillColor=colors.HexColor(MUTED)))
+    return d
+
+
+def _spectrum_chart(freqs: np.ndarray, amps: np.ndarray, unit: str, width: float, height: float,
+                    db: bool = False):
+    from reportlab.graphics.shapes import PolyLine
+    from reportlab.lib import colors
+
+    d, box = _frame(width, height)
+    left, bottom, right, top = box
+    if len(freqs) < 2:
+        return d
+    f = freqs[1:]
+    a = amps[1:]
+    if db:
+        # dB relative to the strongest component: shows small periodic
+        # components that vanish on a linear scale.
+        ref = float(np.max(a)) or 1.0
+        a = 20.0 * np.log10(np.maximum(a / ref, 1e-6))
+        fx, _, hi = envelope(f, a, int(right - left))
+        ymin, ymax = max(-100.0, float(np.min(hi))), 5.0
+        aunit = "dB"
+    else:
+        factor, aunit = _axis_scale(a, unit)
+        a = a / factor
+        fx, _, hi = envelope(f, a, int(right - left))
+        ymin, ymax = 0.0, float(np.max(hi)) * 1.1 or 1.0
+    xmax = float(f[-1]) or 1.0
+
+    def x2px(x):
+        return left + (x / xmax) * (right - left)
+
+    def y2px(v):
+        return bottom + (min(max(v, ymin), ymax) - ymin) / (ymax - ymin) * (top - bottom)
+
+    title = tr("Amplitude (dB, relative to the strongest component)") if db else tr("Amplitude")
+    _draw_axes(d, box, _nice_ticks(0, xmax, 8), _nice_ticks(ymin, ymax, 4), x2px, y2px,
+               lambda v: f"{v:g}", lambda v: f"{v:.3g}",
+               tr("Frequency [Hz]"), f"[{aunit}]", title, ACCENT)
+    d.add(PolyLine([c for x, v in zip(fx, hi) for c in (x2px(x), y2px(v))],
+                   strokeColor=colors.HexColor(ACCENT), strokeWidth=0.7))
+    return d
+
+
+def _histogram_chart(values: np.ndarray, width: float, height: float, bins: int = 60):
+    """Share of time spent at each power level."""
+    from reportlab.graphics.shapes import Rect
+    from reportlab.lib import colors
+
+    d, box = _frame(width, height)
+    left, bottom, right, top = box
+    if len(values) < 2:
+        return d
+    factor, unit = _axis_scale(values, "W")
+    x = values / factor
+    lo, hi = float(np.min(x)), float(np.max(x))
+    if hi <= lo:
+        hi = lo + (abs(lo) * 0.01 or 1e-6)
+    counts, edges = np.histogram(x, bins=bins, range=(lo, hi))
+    share = counts / counts.sum() * 100.0
+    ymax = float(share.max()) * 1.1 or 1.0
+
+    def x2px(v):
+        return left + (v - lo) / (hi - lo) * (right - left)
+
+    def y2px(v):
+        return bottom + v / ymax * (top - bottom)
+
+    _draw_axes(d, box, _nice_ticks(lo, hi, 8), _nice_ticks(0, ymax, 4), x2px, y2px,
+               lambda v: f"{v:.4g}", lambda v: f"{v:g}",
+               f"{tr('Power')} [{unit}]", "[%]", tr("Share of time"), COLOR_P)
+    fill = colors.HexColor(COLOR_P)
+    for k, pct in enumerate(share):
+        if pct <= 0:
+            continue
+        x0, x1 = x2px(edges[k]), x2px(edges[k + 1])
+        d.add(Rect(x0, bottom, max(0.5, x1 - x0 - 0.6), y2px(pct) - bottom,
+                   fillColor=fill, strokeColor=None, strokeWidth=0))
+    return d

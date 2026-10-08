@@ -1,1052 +1,555 @@
-"""Main window for EdgePowerMeter application.
-
-Clean, modular UI for real-time power monitoring with data analysis
-and export capabilities.
-"""
+"""Main window: navigation rail, connection bar, pages and status bar."""
 
 from __future__ import annotations
 
-import time
-from collections import deque
-from datetime import datetime
+import sys
 from pathlib import Path
-from typing import List, Optional, Deque
+from typing import Optional
 
-from PySide6 import QtCore, QtWidgets, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..serial import SerialReader
-from ..core import AppSettings, Statistics, MeasurementRecord, CPUUsageMonitor
-from ..export import ReportGenerator, CSVImporter
-from ..version import __version__, APP_NAME
-from .theme import ThemeColors, DARK_THEME, LIGHT_THEME, generate_stylesheet
-from .dialogs import SettingsDialog
-from .widgets import PlotBuffers, PlotWidget, StatCard, PortDiscovery, CPUBar
+from ..core import AppSettings, CPUUsageMonitor
+from ..i18n import set_language, tr
+from ..version import APP_NAME, __version__
+from .controller import (STATE_CONNECTING, STATE_IDLE, STATE_RECONNECTING, STATE_STALE,
+                         STATE_STREAMING, AcquisitionController)
+from .file_actions import FileActions
+from .marker_actions import MarkerActions
+from .icons import icon
+from .pages.about_page import AboutPage
+from .pages.analysis_page import AnalysisPage
+from .pages.device_page import DevicePage
+from .pages.live_page import LivePage
+from .pages.settings_page import SettingsPage
+from .theme import apply_theme, resolve_theme
+from .widgets.common import Banner, button, confirm, label, set_variant
+from .widgets.cpu_bar import CPUBar
+from .widgets.port_discovery import PortDiscovery
 
+PAGE_LIVE, PAGE_ANALYSIS, PAGE_DEVICE, PAGE_SETTINGS, PAGE_ABOUT = range(5)
 
-# =============================================================================
-# Main Window
-# =============================================================================
+# Settings whose change requires rebuilding the widgets (texts or colors).
+_REBUILD_KEYS = {"language", "theme", "*"}
+
 
 class MainWindow(QtWidgets.QMainWindow):
-    """Main application window."""
-    
-    MIN_PLOT_INTERVAL_MS = 16  # Max 60 FPS (~16ms between updates)
-    STOP_TIMEOUT_MS = 3000
-    MAX_DATA_POINTS = 100000  # Max points before warning
-    
-    def __init__(self):
+    METRICS_INTERVAL_MS = 125
+    SLOW_INTERVAL_MS = 1000
+    PORT_SCAN_MS = 2000
+
+    def __init__(self, gpu_mode: str = "default"):
         super().__init__()
-        self._init_state()
-        self._setup_ui()
-        self._apply_loaded_settings()
-        self._connect_signals()
-        self._setup_plot_throttle()
-        self._setup_port_monitor()
-        self._refresh_ports()
-    
-    def _init_state(self) -> None:
-        self.reader: Optional[SerialReader] = None
-        self.buffers = PlotBuffers()
-        self.full_data: List[MeasurementRecord] = []
-        self.report_generator = ReportGenerator()
-        
-        # Load settings from persistent storage
         self.settings = AppSettings.load()
-        self.theme = DARK_THEME if self.settings.dark_mode else LIGHT_THEME
-        
-        # Flag to track if we're actively acquiring
-        self._acquiring = False
-        self._acq_start_time: float = 0.0  # perf_counter at acquisition start
-        
-        # Rate limiting for plot updates (max 60 FPS)
-        self._last_plot_update: float = 0.0
-        
-        # Running statistics for efficient avg power calculation
-        self._power_sum: float = 0.0
-        self._power_window: Deque[float] = deque(maxlen=1000)  # For moving average
-        
-        # Auto-reconnect state
-        self._last_port: Optional[str] = None
-        self._reconnect_timer: Optional[QtCore.QTimer] = None
-
-        # CPU monitor
+        self._qt_translator: Optional[QtCore.QTranslator] = None
+        self._apply_language()
+        self.gpu_mode = gpu_mode
+        self.ctrl = AcquisitionController(self.settings, self)
+        self.files = FileActions(self.ctrl, self)
+        self.marker_actions = MarkerActions(self.ctrl, self)
+        self.marker_actions.status.connect(lambda text: self.statusBar().showMessage(text, 6000))
         self.cpu_monitor = CPUUsageMonitor()
-        self._cpu_timer: Optional[QtCore.QTimer] = None
-    
-    def _setup_ui(self) -> None:
-        self.setWindowTitle(f"{APP_NAME} v{__version__}")
-        self.setMinimumSize(1200, 800)
-        self.resize(1400, 900)
-        
-        # Set window icon - handle both development and PyInstaller bundle
-        import sys
-        if getattr(sys, 'frozen', False):
-            # Running as PyInstaller bundle
-            base_path = Path(sys._MEIPASS)
-        else:
-            # Running in development
-            base_path = Path(__file__).parent.parent.parent
-        
-        icon_path = base_path / "assets" / "icons" / "icon.png"
-        if icon_path.exists():
-            self.setWindowIcon(QtGui.QIcon(str(icon_path)))
-        
-        self._apply_theme()
-        
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        
-        main_layout = QtWidgets.QVBoxLayout(central)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(12)
-        
-        self._create_header(main_layout)
-        self._create_gpu_banner(main_layout)
-        self._create_connection_bar(main_layout)
-        
-        content = QtWidgets.QHBoxLayout()
-        content.setSpacing(12)
-        
-        self.plot_widget = PlotWidget(self.theme)
-        content.addWidget(self.plot_widget, stretch=4)
-        self._create_stats_panel(content)
-        main_layout.addLayout(content, stretch=1)
-        self._create_control_bar(main_layout)
-        self._create_status_bar(main_layout)
-    
-    def _apply_loaded_settings(self) -> None:
-        """Apply all loaded settings to UI components after setup."""
-        s = self.settings
-        
-        # Plot widget settings
-        self.plot_widget.set_grid(s.show_grid, s.grid_alpha)
-        self.plot_widget.set_crosshair(s.show_crosshair)
-        
-        # Report generator
-        self.report_generator.include_fft = s.include_fft
-        self.report_generator.include_harmonic_analysis = s.include_harmonic_analysis
-        self.report_generator.harmonic_max_order = s.harmonic_max_order
-        self.report_generator.harmonic_signal = s.harmonic_signal
-        
-        # Power window for moving average
-        self._power_window = deque(maxlen=s.moving_average_window)
+        self._data_dirty = False
+        self._page_index = PAGE_LIVE
+        self._software_banner = False
 
-        # CPU monitor toggle
-        self._update_cpu_monitor_enabled()
-    
-    def _apply_theme(self) -> None:
-        self.setStyleSheet(generate_stylesheet(self.theme))
-    
-    def _create_header(self, parent: QtWidgets.QVBoxLayout) -> None:
-        header = QtWidgets.QHBoxLayout()
-        
-        title = QtWidgets.QLabel("⚡ EdgePowerMeter")
-        title.setProperty("class", "title")
-        header.addWidget(title)
-        
-        subtitle = QtWidgets.QLabel("Real-time Power Analysis")
-        subtitle.setProperty("class", "subtitle")
-        header.addWidget(subtitle)
-        
-        header.addStretch()
-        
-        self.settings_btn = QtWidgets.QPushButton("⚙️")
-        self.settings_btn.setProperty("class", "icon")
-        self.settings_btn.setFixedSize(36, 36)
-        self.settings_btn.setToolTip("Settings")
-        self.settings_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        header.addWidget(self.settings_btn)
-        
-        parent.addLayout(header)
+        self.setWindowTitle(f"{APP_NAME} {__version__}")
+        self.setMinimumSize(1100, 720)
+        self._set_window_icon()
 
-    def _create_gpu_banner(self, parent: QtWidgets.QVBoxLayout) -> None:
-        """Persistent warning bar for degraded (software) GPU rendering.
+        self.ctrl.data_appended.connect(self._on_data_appended)
+        self.ctrl.data_reset.connect(self._on_data_reset)
+        self.ctrl.state_changed.connect(self._on_state_changed)
+        self.ctrl.device_changed.connect(self._on_device_changed)
+        self.ctrl.message.connect(self._on_message)
+        self.ctrl.markers_changed.connect(self._on_markers_changed)
+        self.ctrl.recording_changed.connect(self._update_recording_label)
 
-        Hidden by default; shown via show_software_rendering_banner() when
-        app.core.gpu_preflight had to fall back past both the default and
-        NVIDIA-PRIME-offload GL paths, so the user sees a clear reason
-        instead of a sluggish or blank-looking window.
-        """
-        self.gpu_banner = QtWidgets.QFrame()
-        self.gpu_banner.setStyleSheet(
-            f"background-color: {self.theme.accent_warning}; border-radius: 6px;"
-        )
-        banner_layout = QtWidgets.QHBoxLayout(self.gpu_banner)
-        banner_layout.setContentsMargins(12, 8, 12, 8)
+        self._build_ui()
+        self._setup_timers()
+        self._setup_shortcuts()
+        self._restore_geometry()
 
-        label = QtWidgets.QLabel(
-            "⚠ Rendering software attivo: l'accelerazione grafica GPU non è "
-            "disponibile su questo sistema. Prestazioni ridotte."
-        )
-        label.setStyleSheet("color: #1a1a1a; font-weight: 500;")
-        label.setWordWrap(True)
-        banner_layout.addWidget(label, stretch=1)
+    # ------------------------------------------------------------- building
 
-        close_btn = QtWidgets.QPushButton("✕")
-        close_btn.setFixedWidth(28)
-        close_btn.setStyleSheet("background: transparent; border: none; color: #1a1a1a; font-weight: 700;")
-        close_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        close_btn.clicked.connect(self.gpu_banner.hide)
-        banner_layout.addWidget(close_btn)
+    def _set_window_icon(self) -> None:
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent.parent))
+        path = base / "assets" / "icons" / "icon.png"
+        if path.exists():
+            self.setWindowIcon(QtGui.QIcon(str(path)))
 
-        self.gpu_banner.hide()
-        parent.addWidget(self.gpu_banner)
+    def _build_ui(self) -> None:
+        self.theme = resolve_theme(self.settings.theme)
+        apply_theme(QtWidgets.QApplication.instance(), self.theme)
+        t = self.theme
+
+        root = QtWidgets.QWidget()
+        root.setObjectName("Root")
+        h = QtWidgets.QHBoxLayout(root)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+
+        # navigation rail
+        rail = QtWidgets.QFrame()
+        rail.setObjectName("NavRail")
+        rail.setFixedWidth(104)
+        rl = QtWidgets.QVBoxLayout(rail)
+        rl.setContentsMargins(8, 12, 8, 12)
+        rl.setSpacing(6)
+        logo = QtWidgets.QLabel()
+        logo.setPixmap(icon("bolt", t.accent, 28).pixmap(28, 28))
+        logo.setAlignment(QtCore.Qt.AlignCenter)
+        logo.setToolTip(APP_NAME)
+        rl.addWidget(logo)
+        rl.addSpacing(10)
+        self.nav_group = QtWidgets.QButtonGroup(rail)
+        self.nav_group.setExclusive(True)
+        self._nav_buttons = []
+        pages = [("live", tr("Live")), ("analysis", tr("Analysis")), ("device", tr("Device")),
+                 ("settings", tr("Settings")), ("info", tr("About"))]
+        for idx, (ic, text) in enumerate(pages):
+            b = QtWidgets.QToolButton()
+            b.setObjectName("NavButton")
+            b.setText(text)
+            b.setCheckable(True)
+            b.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
+            b.setIconSize(QtCore.QSize(22, 22))
+            b.setFixedSize(92, 60)
+            b.setCursor(QtCore.Qt.PointingHandCursor)
+            b.setToolTip(f"{text}  (Ctrl+{idx + 1})")
+            self.nav_group.addButton(b, idx)
+            self._nav_buttons.append((b, ic))
+            if idx == PAGE_SETTINGS:
+                rl.addStretch()
+            rl.addWidget(b, 0, QtCore.Qt.AlignHCenter)
+        self.nav_group.idClicked.connect(self._show_page)
+        h.addWidget(rail)
+
+        # right column
+        right = QtWidgets.QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(0)
+        right.addWidget(self._build_top_bar())
+
+        self.banner_box = QtWidgets.QVBoxLayout()
+        self.banner_box.setContentsMargins(16, 8, 16, 0)
+        self.gpu_banner = Banner(tr("Software rendering active: GPU acceleration is unavailable on "
+                                    "this system. Performance is reduced."), t.warning)
+        self.gpu_banner.setVisible(self._software_banner)
+        self.banner_box.addWidget(self.gpu_banner)
+        right.addLayout(self.banner_box)
+
+        self.stack = QtWidgets.QStackedWidget()
+        self.live = LivePage(self.ctrl, t)
+        self.analysis = AnalysisPage(self.ctrl, self.files, t)
+        self.device = DevicePage(self.ctrl, t)
+        self.settings_page = SettingsPage(self.settings)
+        self.about = AboutPage(self.gpu_mode, t)
+        for p in (self.live, self.analysis, self.device, self.settings_page, self.about):
+            self.stack.addWidget(p)
+        self.settings_page.changed.connect(self._on_setting_changed)
+        self.live.plot.cursor_values.connect(self._on_cursor)
+        self.live.plot.cursor_left.connect(lambda: self.cursor_label.setText(""))
+        self.analysis.plot.cursor_values.connect(self._on_cursor)
+        self.analysis.plot.cursor_left.connect(lambda: self.cursor_label.setText(""))
+        for plot in (self.live.plot, self.analysis.plot):
+            self.marker_actions.attach(plot)
+        self.live.marker_btn.clicked.connect(self.marker_actions.add_now)
+        self.analysis.del_markers_btn.clicked.connect(self.marker_actions.delete_all)
+        right.addWidget(self.stack, 1)
+        h.addLayout(right, 1)
+        self.setCentralWidget(root)
+
+        self._build_status_bar()
+        self._refresh_nav_icons()
+        self._show_page(self._page_index)
+        self._refresh_ports()
+        self._on_state_changed(self.ctrl.state)
+        self._on_data_reset()
+        self._on_markers_changed()
+        self._update_recording_label()
+
+    def _build_top_bar(self) -> QtWidgets.QWidget:
+        t = self.theme
+        bar = QtWidgets.QFrame()
+        bar.setObjectName("TopBar")
+        lay = QtWidgets.QHBoxLayout(bar)
+        lay.setContentsMargins(20, 10, 16, 10)
+        lay.setSpacing(8)
+        self.page_title = label("", "PageTitle")
+        lay.addWidget(self.page_title)
+        lay.addSpacing(12)
+        self.status_pill = QtWidgets.QFrame()
+        self.status_pill.setObjectName("StatusPill")
+        pill = QtWidgets.QHBoxLayout(self.status_pill)
+        pill.setContentsMargins(10, 3, 12, 3)
+        pill.setSpacing(7)
+        self.status_dot = QtWidgets.QLabel()
+        self.status_dot.setFixedSize(8, 8)
+        pill.addWidget(self.status_dot)
+        self.status_text = label("")
+        pill.addWidget(self.status_text)
+        lay.addWidget(self.status_pill)
+        lay.addStretch()
+
+        self.port_combo = QtWidgets.QComboBox()
+        self.port_combo.setMinimumWidth(260)
+        self.port_combo.setToolTip(tr("Serial port of the meter"))
+        lay.addWidget(self.port_combo)
+        self.refresh_btn = QtWidgets.QToolButton()
+        self.refresh_btn.setObjectName("Chip")
+        self.refresh_btn.setIcon(icon("refresh", t.text_secondary, 16))
+        self.refresh_btn.setToolTip(tr("Refresh the port list"))
+        self.refresh_btn.clicked.connect(self._refresh_ports)
+        lay.addWidget(self.refresh_btn)
+        self.show_all_ports = QtWidgets.QToolButton()
+        self.show_all_ports.setObjectName("Chip")
+        self.show_all_ports.setText(tr("All ports"))
+        self.show_all_ports.setCheckable(True)
+        self.show_all_ports.setToolTip(tr("Also list ports that do not look like USB serial devices"))
+        self.show_all_ports.toggled.connect(self._refresh_ports)
+        lay.addWidget(self.show_all_ports)
+        lay.addSpacing(8)
+
+        self.start_btn = button(tr("Start"), "success", "play", "#ffffff")
+        self.start_btn.setMinimumWidth(110)
+        self.start_btn.setToolTip(tr("Start / stop the acquisition (Ctrl+R)"))
+        self.start_btn.clicked.connect(self.toggle_acquisition)
+        lay.addWidget(self.start_btn)
+        self.clear_btn = button(tr("Clear"), "", "trash", t.text_secondary)
+        self.clear_btn.setToolTip(tr("Delete the recorded data"))
+        self.clear_btn.clicked.connect(self._clear)
+        lay.addWidget(self.clear_btn)
+        return bar
+
+    def _build_status_bar(self) -> None:
+        sb = QtWidgets.QStatusBar()
+        self.setStatusBar(sb)
+        self.cursor_label = label("")
+        self.cursor_label.setStyleSheet("font-family: monospace;")
+        sb.addPermanentWidget(self.cursor_label)
+        self.rec_button = QtWidgets.QToolButton()
+        self.rec_button.setAutoRaise(True)
+        self.rec_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.rec_button.clicked.connect(self.ctrl.open_recordings_folder)
+        sb.addPermanentWidget(self.rec_button)
+        self.samples_label = label("")
+        sb.addPermanentWidget(self.samples_label)
+        self.memory_label = label("")
+        self.memory_label.setToolTip(tr("Memory used by the recorded data"))
+        sb.addPermanentWidget(self.memory_label)
+        self.cpu_bar = CPUBar(bar_count=6)
+        self.cpu_bar.setFixedHeight(16)
+        self.cpu_bar.set_colors(self.theme.accent, self.theme.border)
+        self.cpu_pct = label("--%")
+        sb.addPermanentWidget(self.cpu_bar)
+        sb.addPermanentWidget(self.cpu_pct)
+        show = self.settings.show_cpu_usage
+        self.cpu_bar.setVisible(show)
+        self.cpu_pct.setVisible(show)
+
+    def _refresh_nav_icons(self) -> None:
+        for idx, (b, ic) in enumerate(self._nav_buttons):
+            color = self.theme.accent if idx == self._page_index else self.theme.text_secondary
+            b.setIcon(icon(ic, color, 22))
+
+    def _setup_timers(self) -> None:
+        self.frame_timer = QtCore.QTimer(self)
+        self.frame_timer.timeout.connect(self._on_frame)
+        self.frame_timer.start(int(1000 / self.settings.plot_fps))
+        self.metrics_timer = QtCore.QTimer(self)
+        self.metrics_timer.timeout.connect(self._on_metrics)
+        self.metrics_timer.start(self.METRICS_INTERVAL_MS)
+        self.slow_timer = QtCore.QTimer(self)
+        self.slow_timer.timeout.connect(self._on_slow_tick)
+        self.slow_timer.start(self.SLOW_INTERVAL_MS)
+        self.port_timer = QtCore.QTimer(self)
+        self.port_timer.timeout.connect(self._scan_ports)
+        self.port_timer.start(self.PORT_SCAN_MS)
+
+    def _setup_shortcuts(self) -> None:
+        def sc(seq, fn):
+            QtGui.QShortcut(QtGui.QKeySequence(seq), self, activated=fn)
+        sc("Ctrl+R", self.toggle_acquisition)
+        sc("M", self.marker_actions.add_now)
+        sc("Ctrl+O", lambda: self.files.import_csv())
+        sc("Ctrl+E", lambda: self.files.export_csv(*self._export_target()))
+        sc("Ctrl+P", lambda: self.files.export_pdf(*self._export_target()))
+        for i in range(5):
+            sc(f"Ctrl+{i + 1}", lambda i=i: self._show_page(i))
+
+    def _apply_language(self) -> None:
+        """Select our catalog and Qt's own translations (standard dialogs,
+        e.g. the file dialog's labels and buttons)."""
+        lang = set_language(self.settings.language)
+        app = QtWidgets.QApplication.instance()
+        if self._qt_translator is not None:
+            app.removeTranslator(self._qt_translator)
+            self._qt_translator.deleteLater()
+            self._qt_translator = None
+        if lang != "en":
+            tr_ = QtCore.QTranslator(self)
+            path = QtCore.QLibraryInfo.path(QtCore.QLibraryInfo.TranslationsPath)
+            if tr_.load(f"qtbase_{lang}", path):
+                app.installTranslator(tr_)
+                self._qt_translator = tr_
+
+    def _export_target(self):
+        # The selection only means something on the Analysis page; from any
+        # other page the shortcuts export the whole recording.
+        if self._page_index == PAGE_ANALYSIS:
+            return self.analysis.export_target()
+        return self.ctrl.data(), "all"
+
+    def rebuild_ui(self) -> None:
+        """Recreate every widget (language or theme change); data is kept."""
+        old = self.centralWidget()
+        if old is not None:
+            # Pages connected to controller signals must be disconnected,
+            # otherwise the deleted widgets keep receiving them.
+            self.device.detach()
+        self._build_ui()
+        if old is not None:
+            old.deleteLater()
 
     def show_software_rendering_banner(self) -> None:
-        """Surface the degraded-rendering warning set by app.main after
-        app.core.gpu_preflight.ensure_gpu_ready() fell back to software
-        rendering."""
+        self._software_banner = True
         self.gpu_banner.show()
 
-    def _create_connection_bar(self, parent: QtWidgets.QVBoxLayout) -> None:
-        frame = QtWidgets.QFrame()
-        frame.setProperty("class", "card")
-        
-        layout = QtWidgets.QHBoxLayout(frame)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(10)
-        
-        layout.addWidget(QtWidgets.QLabel("Port:"))
-        
-        self.port_combo = QtWidgets.QComboBox()
-        self.port_combo.setMinimumWidth(280)
-        layout.addWidget(self.port_combo)
-        
-        self.refresh_btn = QtWidgets.QPushButton("↻ Refresh")
-        self.refresh_btn.setMinimumWidth(100)
-        layout.addWidget(self.refresh_btn)
-        
-        self.show_all_cb = QtWidgets.QCheckBox("Show all")
-        layout.addWidget(self.show_all_cb)
-        
-        layout.addStretch()
-        
-        # Start and Stop buttons together
-        self.connect_btn = QtWidgets.QPushButton("▶ Start")
-        self.connect_btn.setProperty("class", "success")
-        self.connect_btn.setMinimumWidth(100)
-        layout.addWidget(self.connect_btn)
-        
-        self.stop_btn = QtWidgets.QPushButton("⏹ Stop")
-        self.stop_btn.setProperty("class", "danger")
-        self.stop_btn.setMinimumWidth(100)
-        self.stop_btn.setEnabled(False)
-        layout.addWidget(self.stop_btn)
-        
-        parent.addWidget(frame)
-    
-    def _create_stats_panel(self, parent: QtWidgets.QHBoxLayout) -> None:
-        frame = QtWidgets.QFrame()
-        frame.setProperty("class", "card")
-        frame.setFixedWidth(200)
-        
-        layout = QtWidgets.QVBoxLayout(frame)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
-        
-        title = QtWidgets.QLabel("📊 Live")
-        title.setProperty("class", "subtitle")
-        layout.addWidget(title)
-        
-        self.voltage_card = StatCard("VOLTAGE", "V", self.theme.chart_voltage)
-        layout.addWidget(self.voltage_card)
-        
-        self.current_card = StatCard("CURRENT", "A", self.theme.chart_current)
-        layout.addWidget(self.current_card)
-        
-        self.power_card = StatCard("POWER", "W", self.theme.chart_power)
-        layout.addWidget(self.power_card)
-        
-        self.avg_power_card = StatCard("AVG POWER", "W", self.theme.accent_primary)
-        layout.addWidget(self.avg_power_card)
-        
-        self.sample_rate_card = StatCard("SAMPLE RATE", "Hz", self.theme.text_secondary)
-        layout.addWidget(self.sample_rate_card)
-        
-        layout.addSpacing(10)
-        
-        sel_title = QtWidgets.QLabel("📐 Selection")
-        sel_title.setProperty("class", "subtitle")
-        layout.addWidget(sel_title)
-        
-        self.sel_samples_label = QtWidgets.QLabel("Samples: --")
-        self.sel_samples_label.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
-        layout.addWidget(self.sel_samples_label)
-        
-        self.sel_duration_label = QtWidgets.QLabel("Duration: --")
-        self.sel_duration_label.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
-        layout.addWidget(self.sel_duration_label)
-        
-        self.sel_power_label = QtWidgets.QLabel("Avg Power: --")
-        self.sel_power_label.setStyleSheet(f"color: {self.theme.chart_power}; font-size: 11px;")
-        layout.addWidget(self.sel_power_label)
-        
-        layout.addStretch()
-        parent.addWidget(frame)
-    
-    def _create_control_bar(self, parent: QtWidgets.QVBoxLayout) -> None:
-        frame = QtWidgets.QFrame()
-        frame.setProperty("class", "card")
-        
-        layout = QtWidgets.QHBoxLayout(frame)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(8)
-        
-        self.import_btn = QtWidgets.QPushButton("📂 Import")
-        self.import_btn.setMinimumWidth(90)
-        self.import_btn.setToolTip("Import data from CSV file")
-        layout.addWidget(self.import_btn)
-        
-        layout.addStretch()
-        
-        self.select_all_btn = QtWidgets.QPushButton("Select All")
-        self.select_all_btn.setMinimumWidth(100)
-        self.select_all_btn.setEnabled(False)
-        layout.addWidget(self.select_all_btn)
-        
-        layout.addSpacing(10)
-        
-        self.export_csv_btn = QtWidgets.QPushButton("📄 CSV")
-        self.export_csv_btn.setMinimumWidth(90)
-        self.export_csv_btn.setEnabled(False)
-        layout.addWidget(self.export_csv_btn)
-        
-        self.export_pdf_btn = QtWidgets.QPushButton("📊 PDF")
-        self.export_pdf_btn.setMinimumWidth(90)
-        self.export_pdf_btn.setEnabled(False)
-        layout.addWidget(self.export_pdf_btn)
-        
-        layout.addSpacing(10)
-        
-        self.clear_btn = QtWidgets.QPushButton("🗑 Clear")
-        self.clear_btn.setProperty("class", "danger")
-        self.clear_btn.setMinimumWidth(90)
-        layout.addWidget(self.clear_btn)
-        
-        parent.addWidget(frame)
-    
-    def _create_status_bar(self, parent: QtWidgets.QVBoxLayout) -> None:
-        layout = QtWidgets.QHBoxLayout()
-        layout.setContentsMargins(4, 0, 4, 0)
-        
-        self.status_label = QtWidgets.QLabel("● Disconnected")
-        self.status_label.setStyleSheet(f"color: {self.theme.text_muted};")
-        layout.addWidget(self.status_label)
+    # -------------------------------------------------------------- pages
 
-        # CPU usage indicator (hidden unless enabled in settings)
-        self.cpu_label = QtWidgets.QLabel("CPU")
-        self.cpu_label.setStyleSheet(f"color: {self.theme.text_secondary};")
-        self.cpu_bar = CPUBar(bar_count=6)
-        self.cpu_pct = QtWidgets.QLabel("--%")
-        self.cpu_pct.setStyleSheet(f"color: {self.theme.text_secondary}; font-family: monospace;")
-        layout.addSpacing(12)
-        layout.addWidget(self.cpu_label)
-        layout.addWidget(self.cpu_bar)
-        layout.addWidget(self.cpu_pct)
+    def _show_page(self, idx: int) -> None:
+        self._page_index = idx
+        self.stack.setCurrentIndex(idx)
+        b = self.nav_group.button(idx)
+        if b is not None:
+            b.setChecked(True)
+        self.page_title.setText(self._nav_buttons[idx][0].text())
+        self._refresh_nav_icons()
+        if idx == PAGE_LIVE:
+            self.live.refresh()
+        elif idx == PAGE_ANALYSIS:
+            self.analysis.apply_settings(self.settings)
+            self.analysis.refresh_live(force=True)
+        elif idx == PAGE_DEVICE:
+            self.device.update_status()
 
-        # Hidden by default, toggled by settings
-        self.cpu_label.setVisible(False)
-        self.cpu_pct.setVisible(False)
-        
-        layout.addStretch()
-        
-        # Cursor values display
-        self.cursor_label = QtWidgets.QLabel("")
-        self.cursor_label.setStyleSheet(f"color: {self.theme.text_secondary}; font-family: monospace;")
-        layout.addWidget(self.cursor_label)
-        
-        layout.addSpacing(20)
-        
-        self.samples_label = QtWidgets.QLabel("Samples: 0")
-        self.samples_label.setStyleSheet(f"color: {self.theme.text_secondary};")
-        self.cpu_label.setStyleSheet(f"color: {self.theme.text_secondary};")
-        # Use existing border color as background track
-        self.cpu_bar.set_colors(self.theme.accent_primary, self.theme.border_default)
-        layout.addWidget(self.samples_label)
-        
-        parent.addLayout(layout)
-    
-    def _connect_signals(self) -> None:
-        self.refresh_btn.clicked.connect(self._refresh_ports)
-        self.show_all_cb.stateChanged.connect(self._refresh_ports)
-        self.connect_btn.clicked.connect(self._start_acquisition)
-        self.stop_btn.clicked.connect(self._stop_acquisition)
-        
-        self.import_btn.clicked.connect(self._import_csv)
-        self.select_all_btn.clicked.connect(self._select_all)
-        self.export_csv_btn.clicked.connect(self._export_csv)
-        self.export_pdf_btn.clicked.connect(self._export_pdf)
-        self.clear_btn.clicked.connect(self._clear_data)
-        
-        self.settings_btn.clicked.connect(self._open_settings)
-        
-        # Connect plot view changes (pan, zoom) to trigger re-render
-        self.plot_widget.view_changed.connect(self._request_plot_update)
-        
-        # Connect cursor values signal
-        self.plot_widget.cursor_values.connect(self._on_cursor_values)
+    # -------------------------------------------------------- acquisition
 
-        # Keep selection stats (samples/duration/avg power) live while the
-        # user drags the export region selector.
-        self.plot_widget.region_changed.connect(self._update_selection_stats)
-
-    def _on_cursor_values(self, t: float, v: float, i: float, p: float) -> None:
-        """Update cursor values display."""
-        self.cursor_label.setText(
-            f"T: {t:.3f}s | V: {v:.4f}V | I: {i:.4f}A | P: {p:.4f}W"
-        )
-    
-    def _setup_port_monitor(self) -> None:
-        """Setup OS-level port change monitoring for auto-reconnect."""
-        import sys
-        if sys.platform == 'linux':
-            self._setup_linux_port_monitor()
-        else:
-            # Fallback: periodic check (less efficient but works everywhere)
-            self._port_check_timer = QtCore.QTimer()
-            self._port_check_timer.timeout.connect(self._check_port_availability)
-            self._port_check_timer.start(2000)  # Check every 2 seconds
-    
-    def _setup_linux_port_monitor(self) -> None:
-        """Use inotify to watch for USB device changes on Linux."""
-        try:
-            from PySide6.QtCore import QSocketNotifier
-            import os
-            
-            # Watch /dev for device changes
-            # We use a simpler approach: QFileSystemWatcher on /dev/serial/by-id
-            from PySide6.QtCore import QFileSystemWatcher
-            
-            self._port_watcher = QFileSystemWatcher()
-            
-            # Watch common serial device directories
-            watch_paths = ['/dev/serial/by-id', '/dev/serial/by-path', '/dev']
-            for path in watch_paths:
-                if os.path.exists(path):
-                    self._port_watcher.addPath(path)
-            
-            self._port_watcher.directoryChanged.connect(self._on_port_change)
-        except Exception:
-            # Fallback to timer-based checking
-            self._port_check_timer = QtCore.QTimer()
-            self._port_check_timer.timeout.connect(self._check_port_availability)
-            self._port_check_timer.start(2000)
-    
-    def _on_port_change(self, path: str) -> None:
-        """Called when serial port directory changes."""
-        # Refresh port list
-        self._refresh_ports()
-        
-        # Try to reconnect if we were disconnected and auto-reconnect is enabled
-        if (self.settings.auto_reconnect and 
-            self._last_port and 
-            not self._acquiring and
-            not self._is_connected()):
-            self._try_reconnect()
-    
-    def _check_port_availability(self) -> None:
-        """Periodic check for port changes (fallback for non-Linux)."""
-        if not self.settings.auto_reconnect:
+    def toggle_acquisition(self) -> None:
+        if self.ctrl.is_running:
+            self.ctrl.stop()
             return
-        
-        if self._last_port and not self._acquiring and not self._is_connected():
-            self._try_reconnect()
-    
-    def _try_reconnect(self) -> None:
-        """Attempt to reconnect to the last used port."""
-        if not self._last_port:
-            return
-        
-        # Check if port is available
-        available = PortDiscovery.list_ports()
-        
-        if self._last_port in available:
-            self.status_label.setText(f"● Reconnecting to {self._last_port}...")
-            self.status_label.setStyleSheet(f"color: {self.theme.accent_warning};")
-            
-            # Set port in combo box
-            for i in range(self.port_combo.count()):
-                if self.port_combo.itemData(i) == self._last_port:
-                    self.port_combo.setCurrentIndex(i)
-                    break
-            
-            # Start acquisition
-            QtCore.QTimer.singleShot(500, self._start_acquisition)
-    
-    def _setup_plot_throttle(self) -> None:
-        """Setup event-driven plot updates with rate limiting."""
-        # Timer fires only when plot is dirty, with rate limiting
-        self._plot_timer = QtCore.QTimer()
-        self._plot_timer.setSingleShot(True)
-        self._plot_timer.timeout.connect(self._do_plot_update)
-    
-    def _request_plot_update(self) -> None:
-        """Request a plot update (rate-limited to 60 FPS max)."""
-        now = time.perf_counter()
-        elapsed_ms = (now - self._last_plot_update) * 1000
-        
-        if elapsed_ms >= self.MIN_PLOT_INTERVAL_MS:
-            self._do_plot_update()
-        elif not self._plot_timer.isActive():
-            wait_ms = int(self.MIN_PLOT_INTERVAL_MS - elapsed_ms) + 1
-            self._plot_timer.start(wait_ms)
-    
-    def _do_plot_update(self) -> None:
-        """Actually perform the plot update."""
-        self._plot_dirty = False
-        self._last_plot_update = time.perf_counter()
-        
-        # Always update with current buffers (works during and after acquisition)
-        if not self.buffers.is_empty:
-            self.plot_widget.update_data(self.buffers)
-        self._update_selection_stats()
-    
-    # -------------------------------------------------------------------------
-    # Settings
-    # -------------------------------------------------------------------------
-    
-    def _open_settings(self) -> None:
-        dialog = SettingsDialog(self.settings, self.theme, self)
-        dialog.theme_changed.connect(self._on_theme_changed)
-        dialog.settings_changed.connect(self._on_settings_changed)
-        dialog.exec()
-    
-    def _on_theme_changed(self, dark_mode: bool) -> None:
-        self.theme = DARK_THEME if dark_mode else LIGHT_THEME
-        self.settings.dark_mode = dark_mode
-        self._apply_theme()
-        self._update_theme_widgets()
-    
-    def _update_theme_widgets(self) -> None:
-        """Update widgets with theme colors."""
-        self.plot_widget.update_theme(self.theme)
-        
-        connected = self._is_connected()
-        self.status_label.setStyleSheet(
-            f"color: {self.theme.accent_success if connected else self.theme.text_muted};"
-        )
-        self.samples_label.setStyleSheet(f"color: {self.theme.text_secondary};")
-        self.sel_samples_label.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
-        self.sel_duration_label.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
-        self.sel_power_label.setStyleSheet(f"color: {self.theme.chart_power}; font-size: 11px;")
-        
-        self.voltage_card.value_label.setStyleSheet(f"color: {self.theme.chart_voltage};")
-        self.current_card.value_label.setStyleSheet(f"color: {self.theme.chart_current};")
-        self.power_card.value_label.setStyleSheet(f"color: {self.theme.chart_power};")
-
-    def _update_cpu_monitor_enabled(self) -> None:
-        """Show/hide and start/stop CPU usage indicator based on settings."""
-        enabled = getattr(self.settings, "show_cpu_usage", False)
-        self.cpu_label.setVisible(enabled)
-        self.cpu_bar.setVisible(enabled)
-        self.cpu_pct.setVisible(enabled)
-
-        if enabled:
-            if self._cpu_timer is None:
-                self._cpu_timer = QtCore.QTimer()
-                self._cpu_timer.timeout.connect(self._update_cpu_usage)
-            if not self._cpu_timer.isActive():
-                self._cpu_timer.start(1000)  # 1 Hz update
-        else:
-            if self._cpu_timer and self._cpu_timer.isActive():
-                self._cpu_timer.stop()
-            self.cpu_bar.set_usage(0)
-            self.cpu_pct.setText("--%")
-
-    def _update_cpu_usage(self) -> None:
-        usage = self.cpu_monitor.get_usage()
-        if usage is None:
-            return
-        self.cpu_bar.set_usage(usage)
-        self.cpu_pct.setText(f"{usage:.0f}%")
-    
-    def _on_settings_changed(self, settings: AppSettings) -> None:
-        self.settings = settings
-        self.buffers.max_points = settings.plot_points
-        
-        # Update power window size for moving average
-        new_window = deque(self._power_window, maxlen=settings.moving_average_window)
-        self._power_window = new_window
-        
-        # Update plot widget settings
-        self.plot_widget.set_grid(settings.show_grid, settings.grid_alpha)
-        self.plot_widget.set_crosshair(settings.show_crosshair)
-        
-        # Update report generator FFT setting
-        self.report_generator.include_fft = settings.include_fft
-        self.report_generator.include_harmonic_analysis = settings.include_harmonic_analysis
-        self.report_generator.harmonic_max_order = settings.harmonic_max_order
-        self.report_generator.harmonic_signal = settings.harmonic_signal
-
-        # CPU monitor toggle
-        self._update_cpu_monitor_enabled()
-        
-        # Save settings to persistent storage
-        settings.save()
-        
-        # Request plot update to apply any visual changes
-        self._request_plot_update()
-    
-    # -------------------------------------------------------------------------
-    # Connection
-    # -------------------------------------------------------------------------
-    
-    def _refresh_ports(self) -> None:
-        self.port_combo.clear()
-        for device, label in PortDiscovery.get_ports(self.show_all_cb.isChecked()):
-            self.port_combo.addItem(label, device)
-    
-    def _toggle_connection(self) -> None:
-        if self._is_connected():
-            self._stop_acquisition()
-        else:
-            self._start_acquisition()
-    
-    def _is_connected(self) -> bool:
-        return self.reader is not None and self.reader.isRunning()
-    
-    def _start_acquisition(self) -> None:
         port = self.port_combo.currentData()
         if not port:
-            QtWidgets.QMessageBox.warning(self, "Error", "Select a serial port first.")
+            QtWidgets.QMessageBox.information(self, tr("Start"), tr("Select a serial port first."))
             return
-        
-        # Save port for auto-reconnect
-        self._last_port = port
-        
-        # Make sure any previous reader is fully stopped
-        if self.reader is not None:
-            try:
-                self.reader.data_received.disconnect(self._on_data)
-                self.reader.error.disconnect(self._on_error)
-                self.reader.data_stale.disconnect(self._on_data_stale)
-                self.reader.data_resumed.disconnect(self._on_data_resumed)
-            except RuntimeError:
-                pass
-            self.reader.stop(self.STOP_TIMEOUT_MS)
-            self.reader = None
-        
-        # Clear data BEFORE starting reader to avoid race condition
-        self._clear_data()
-        
-        # Longer delay to ensure port is released and buffers are clean
-        QtCore.QCoreApplication.processEvents()
-        QtCore.QThread.msleep(200)
-        
-        # Create and start new reader
-        self.reader = SerialReader(
-            port,
-            baud=self.settings.baud_rate,
-            target_sample_rate=self.settings.target_sample_rate,
-            max_device_rate=self.settings.max_device_sample_rate,
-        )
-        self.reader.data_received.connect(self._on_data, QtCore.Qt.QueuedConnection)
-        self.reader.error.connect(self._on_error, QtCore.Qt.QueuedConnection)
-        self.reader.data_stale.connect(self._on_data_stale, QtCore.Qt.QueuedConnection)
-        self.reader.data_resumed.connect(self._on_data_resumed, QtCore.Qt.QueuedConnection)
-        self.reader.start()
-        
-        # Now we're acquiring - record start time
-        self._acquiring = True
-        self._acq_start_time = time.perf_counter()
-        
-        self.connect_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        
-        # Disable PDF export during acquisition (CSV stays disabled from clear)
-        self.export_pdf_btn.setEnabled(False)
-        self.export_csv_btn.setEnabled(False)
-        self.select_all_btn.setEnabled(False)
-        
-        self.status_label.setText(f"● Connected: {port}")
-        self.status_label.setStyleSheet(f"color: {self.theme.accent_success};")
-    
-    def _stop_acquisition(self) -> None:
-        # Stop acquiring first
-        self._acquiring = False
-        
-        if self.reader:
-            # Disconnect signals first to avoid race conditions
-            try:
-                self.reader.data_received.disconnect(self._on_data)
-                self.reader.error.disconnect(self._on_error)
-                self.reader.data_stale.disconnect(self._on_data_stale)
-                self.reader.data_resumed.disconnect(self._on_data_resumed)
-            except RuntimeError:
-                pass  # Already disconnected
-            
-            self.reader.stop(self.STOP_TIMEOUT_MS)
-            self.reader = None
-        
-        self.connect_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        
-        self.status_label.setText("● Disconnected")
-        self.status_label.setStyleSheet(f"color: {self.theme.text_muted};")
-        
-        # Enable export after stopping if we have data
-        if self.full_data:
-            # Small delay to ensure plot is updated before showing region selector
-            QtCore.QTimer.singleShot(100, self._enable_export)
-    
-    # -------------------------------------------------------------------------
-    # Data Handling
-    # -------------------------------------------------------------------------
-    
-    def _on_data(self, data: dict) -> None:
-        # Ignore data if we're not actively acquiring
-        if not self._acquiring:
+        if not self.files.confirm_discard():
             return
-        
-        # Use local perf_counter for relative time (reliable, no RTC issues)
-        rel_time = time.perf_counter() - self._acq_start_time
-        
-        # Keep firmware timestamp for export
-        ts = data['timestamp']
-        unix_time = ts.timestamp() if ts else time.time()
-        
-        v, i, p = data['voltage'], data['current'], data['power']
-        
-        # Use relative time for plotting
-        self.buffers.append(rel_time, v, i, p)
-        
-        self.full_data.append(MeasurementRecord(ts, unix_time, rel_time, v, i, p))
-        
-        # Update running statistics
-        self._power_sum += p
-        self._power_window.append(p)
-        
-        # Request plot update (rate-limited to 60 FPS)
-        self._request_plot_update()
-        
-        # Update stat cards every 5 samples (~20Hz at 100Hz input)
-        n = len(self.full_data)
-        if n % 5 == 0:
-            self._update_stat_cards(v, i, p)
-        
-        # Update sample count every 50 samples
-        if n % 50 == 0:
-            self.samples_label.setText(f"Samples: {n:,}")
-    
-    def _update_stat_cards(self, v: float, i: float, p: float) -> None:
-        """Update the stat cards with current values."""
-        self.voltage_card.set_value(v)
-        self.current_card.set_value(i)
-        self.power_card.set_value(p)
-        self.avg_power_card.set_value(self._calculate_avg_power())
-        
-        # Calculate and display sample rate
-        if len(self.full_data) >= 2:
-            # Use last 50 samples for accurate rate calculation
-            recent_samples = min(50, len(self.full_data))
-            time_diff = self.full_data[-1].relative_time - self.full_data[-recent_samples].relative_time
-            if time_diff > 0:
-                sample_rate = (recent_samples - 1) / time_diff
-                self.sample_rate_card.set_value(sample_rate)
-    
-    def _calculate_avg_power(self) -> float:
-        """Calculate average power efficiently using running statistics."""
-        if not self.full_data:
-            return 0.0
-        
-        if self.settings.use_moving_average:
-            # Moving average using deque - O(1)
-            if self._power_window:
-                return sum(self._power_window) / len(self._power_window)
-            return 0.0
+        self.ctrl.start(port)
+        if self._page_index not in (PAGE_LIVE, PAGE_DEVICE):
+            self._show_page(PAGE_LIVE)
+
+    def _clear(self) -> None:
+        if not self.files.confirm_discard():
+            return
+        self.ctrl.clear()
+
+    def _refresh_ports(self) -> None:
+        current = self.port_combo.currentData() or self.ctrl.port
+        ports = PortDiscovery.get_ports(self.show_all_ports.isChecked())
+        self._port_signature = tuple(p for p, _ in ports)
+        self.port_combo.blockSignals(True)
+        self.port_combo.clear()
+        for device, text in ports:
+            self.port_combo.addItem(text, device)
+        if not ports:
+            self.port_combo.addItem(tr("No device found"), None)
+        idx = self.port_combo.findData(current)
+        if idx >= 0:
+            self.port_combo.setCurrentIndex(idx)
+        self.port_combo.blockSignals(False)
+
+    def _scan_ports(self) -> None:
+        # Cheap periodic rescan while idle so plugging the meter in shows up
+        # without clicking Refresh. Never starts an acquisition by itself.
+        if self.ctrl.is_running or self.port_combo.view().isVisible():
+            return
+        ports = tuple(p for p, _ in PortDiscovery.get_ports(self.show_all_ports.isChecked()))
+        if ports != getattr(self, "_port_signature", None):
+            self._refresh_ports()
+
+    # ------------------------------------------------------------ signals
+
+    def _on_data_appended(self) -> None:
+        self._data_dirty = True
+
+    def _on_data_reset(self) -> None:
+        self._data_dirty = False
+        self.live.on_data_reset()
+        self.analysis.on_data_reset()
+        self._update_status_labels()
+
+    def _on_frame(self) -> None:
+        if self._data_dirty and self._page_index == PAGE_LIVE:
+            self._data_dirty = False
+            self.live.refresh()
+
+    def _on_metrics(self) -> None:
+        if self._page_index == PAGE_LIVE:
+            self.live.update_metrics()
+
+    def _on_slow_tick(self) -> None:
+        self._update_status_labels()
+        if self.ctrl.is_recording_to_disk:
+            self._update_recording_label()
+        if self._page_index == PAGE_ANALYSIS and self.ctrl.is_running:
+            self.analysis.refresh_live()
+        elif self._page_index == PAGE_DEVICE:
+            self.device.update_status()
+        if self.settings.show_cpu_usage:
+            usage = self.cpu_monitor.get_usage()
+            if usage is not None:
+                self.cpu_bar.set_usage(usage)
+                self.cpu_pct.setText(f"CPU {usage:.0f}%")
+        if self.ctrl.state == STATE_STREAMING:
+            self._on_state_changed(STATE_STREAMING)   # refresh the rate in the pill
+
+    def _on_markers_changed(self) -> None:
+        markers = self.ctrl.markers.sorted()
+        self.live.plot.set_markers(markers)
+        self.analysis.on_markers_changed()
+
+    def _update_recording_label(self) -> None:
+        c = self.ctrl
+        path = c.recording_path
+        if path is None:
+            self.rec_button.setVisible(False)
+            return
+        self.rec_button.setVisible(True)
+        size = c.writer.size_bytes / 1e6 if c.writer is not None else 0.0
+        if c.is_recording_to_disk:
+            self.rec_button.setText(tr("Recording to {file} ({size})", file=path.name,
+                                       size=f"{size:.1f} MB"))
+            self.rec_button.setStyleSheet(f"color: {self.theme.danger};")
         else:
-            # Total average using running sum - O(1)
-            return self._power_sum / len(self.full_data)
-    
-    def _on_error(self, msg: str) -> None:
-        QtWidgets.QMessageBox.critical(self, "Serial Error", msg)
-        self._stop_acquisition()
+            self.rec_button.setText(tr("Saved: {file}", file=path.name))
+            self.rec_button.setStyleSheet(f"color: {self.theme.text_secondary};")
+        self.rec_button.setToolTip(tr("{path}\nClick to open the folder.", path=str(path)))
 
-    def _on_data_stale(self, elapsed: float) -> None:
-        """Device still connected but has sent no valid measurement for a while."""
-        if not self._acquiring:
-            return
-        self.status_label.setText(f"⚠ Nessun dato da {elapsed:.0f}s...")
-        self.status_label.setStyleSheet(f"color: {self.theme.accent_warning};")
+    def _update_status_labels(self) -> None:
+        n = len(self.ctrl.store)
+        self.samples_label.setText(tr("{n} samples", n=f"{n:,}"))
+        mb = self.ctrl.store.nbytes / 1e6
+        self.memory_label.setText(f"{mb:.1f} MB")
 
-    def _on_data_resumed(self) -> None:
-        """Data flow resumed after a stale warning."""
-        if not self._acquiring or not self.reader:
-            return
-        self.status_label.setText(f"● Connected: {self.reader.port}")
-        self.status_label.setStyleSheet(f"color: {self.theme.accent_success};")
-    
-    def _clear_data(self) -> None:
-        self.buffers.clear()
-        self.full_data = []
-        
-        # Reset running statistics
-        self._power_sum = 0.0
-        self._power_window.clear()
-        
-        self.plot_widget.clear_data()
-        self.select_all_btn.setEnabled(False)
-        
-        # Disable and remove colored classes (back to grey)
-        self.export_csv_btn.setEnabled(False)
-        self.export_csv_btn.setProperty("class", "")
-        self.export_csv_btn.style().unpolish(self.export_csv_btn)
-        self.export_csv_btn.style().polish(self.export_csv_btn)
-        
-        self.export_pdf_btn.setEnabled(False)
-        self.export_pdf_btn.setProperty("class", "")
-        self.export_pdf_btn.style().unpolish(self.export_pdf_btn)
-        self.export_pdf_btn.style().polish(self.export_pdf_btn)
-        
-        self.samples_label.setText("Samples: 0")
-        self.voltage_card.set_value(0)
-        self.current_card.set_value(0)
-        self.power_card.set_value(0)
-        self.avg_power_card.set_value(0)
-        
-        self.sel_samples_label.setText("Samples: --")
-        self.sel_duration_label.setText("Duration: --")
-        self.sel_power_label.setText("Avg Power: --")
-    
-    # -------------------------------------------------------------------------
-    # Selection & Export
-    # -------------------------------------------------------------------------
-    
-    def _enable_export(self) -> None:
-        if not self.full_data:
-            return
-        
-        # Use relative time for region selector (starts from 0)
-        t_min = self.full_data[0].relative_time
-        t_max = self.full_data[-1].relative_time
-        
-        # Reset view to show all data before adding region selector
-        self.plot_widget.show_full_range(t_min, t_max)
-        self.plot_widget.add_region_selector(t_min, t_max)
-        
-        self.select_all_btn.setEnabled(True)
-        
-        # Enable with colors: CSV green, PDF blue
-        self.export_csv_btn.setEnabled(True)
-        self.export_csv_btn.setProperty("class", "success")
-        self.export_csv_btn.style().unpolish(self.export_csv_btn)
-        self.export_csv_btn.style().polish(self.export_csv_btn)
-        
-        self.export_pdf_btn.setEnabled(True)
-        self.export_pdf_btn.setProperty("class", "primary")
-        self.export_pdf_btn.style().unpolish(self.export_pdf_btn)
-        self.export_pdf_btn.style().polish(self.export_pdf_btn)
-    
-    def _select_all(self) -> None:
-        if not self.full_data:
-            return
-        t_min = self.full_data[0].relative_time
-        t_max = self.full_data[-1].relative_time
-        self.plot_widget.add_region_selector(t_min, t_max)
-    
-    def _get_selected_records(self) -> List[MeasurementRecord]:
-        time_range = self.plot_widget.get_selected_range()
-        if not time_range:
-            return self.full_data
-        t0, t1 = time_range
-        # Filter by relative time (matches the plot axis)
-        return [r for r in self.full_data if t0 <= r.relative_time <= t1]
-    
-    def _update_selection_stats(self) -> None:
-        records = self._get_selected_records()
-        
-        if len(records) < 2:
-            self.sel_samples_label.setText("Samples: --")
-            self.sel_duration_label.setText("Duration: --")
-            self.sel_power_label.setText("Avg Power: --")
-            return
-        
-        # Use relative_time for accurate duration (unix_time can have sync issues)
-        duration = records[-1].relative_time - records[0].relative_time
-        avg_power = sum(r.power for r in records) / len(records)
-        
-        self.sel_samples_label.setText(f"Samples: {len(records):,}")
-        if duration < 60:
-            self.sel_duration_label.setText(f"Duration: {duration:.1f}s")
-        elif duration < 3600:
-            self.sel_duration_label.setText(f"Duration: {duration/60:.1f}m")
+    def _on_state_changed(self, state: str) -> None:
+        t = self.theme
+        self._update_status_labels()
+        running = self.ctrl.is_running
+        if running:
+            self.start_btn.setText(tr("Stop"))
+            self.start_btn.setIcon(icon("stop", "#ffffff", 18))
+            set_variant(self.start_btn, "danger")
         else:
-            self.sel_duration_label.setText(f"Duration: {duration/3600:.1f}h")
-        self.sel_power_label.setText(f"Avg Power: {avg_power:.3f} W")
-    
-    def _import_csv(self) -> None:
-        """Import measurements from a CSV file."""
-        if self._is_connected():
-            QtWidgets.QMessageBox.warning(
-                self, "Warning", 
-                "Stop acquisition before importing data."
-            )
-            return
-        
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Import CSV", "", 
-            "CSV Files (*.csv);;Text Files (*.txt);;All Files (*)"
-        )
-        
-        if not path:
-            return
-        
-        try:
-            records = CSVImporter.import_csv(Path(path))
-            
-            # Clear existing data and load imported
-            self._clear_data()
-            self.full_data = records
+            self.start_btn.setText(tr("Start"))
+            self.start_btn.setIcon(icon("play", "#ffffff", 18))
+            set_variant(self.start_btn, "success")
+        self.port_combo.setEnabled(not running)
+        self.refresh_btn.setEnabled(not running)
+        self.show_all_ports.setEnabled(not running)
 
-            # Populate plot buffers using relative time (consistent with live
-            # acquisition and immune to millisecond-collision point dropping).
-            for r in records:
-                self.buffers.append(r.relative_time, r.voltage, r.current, r.power)
+        rate = self.ctrl.recent_rate()
+        text, color = {
+            STATE_IDLE: (tr("Disconnected"), t.text_muted),
+            STATE_CONNECTING: (tr("Connecting..."), t.warning),
+            STATE_STREAMING: (tr("Live · {rate}", rate=f"{rate:.0f} Hz"), t.success),
+            STATE_STALE: (tr("No data"), t.warning),
+            STATE_RECONNECTING: (tr("Reconnecting..."), t.warning),
+        }.get(state, (state, t.text_muted))
+        if state == STATE_IDLE and self.ctrl.source_name and len(self.ctrl.store):
+            text = tr("Stopped") if self.ctrl.source == "live" else tr("File loaded")
+        self.status_text.setText(text)
+        self.status_text.setStyleSheet(f"color: {color}; font-weight: 600; font-size: 12px;")
+        self.status_dot.setStyleSheet(f"background: {color}; border-radius: 4px;")
+        self.status_pill.setStyleSheet(
+            f"QFrame#StatusPill {{ background: {t.surface_alt}; border: 1px solid {t.border}; "
+            f"border-radius: 12px; }}")
+        if self._page_index == PAGE_DEVICE:
+            self.device.update_status()
+        elif self._page_index == PAGE_ANALYSIS and state == STATE_IDLE:
+            self.analysis.refresh_live(force=True)
 
-            # Rebuild running power statistics so AVG POWER is correct after import
-            self._power_sum = sum(r.power for r in records)
-            self._power_window.clear()
-            self._power_window.extend(r.power for r in records)
+    def _on_device_changed(self) -> None:
+        if self._page_index == PAGE_DEVICE:
+            self.device.update_status()
 
-            # Update plot
-            self._do_plot_update()
-            self._enable_export()
+    def _on_message(self, level: str, text: str) -> None:
+        if level == "error":
+            self.statusBar().showMessage(text, 15000)
+            QtWidgets.QMessageBox.warning(self, APP_NAME, text)
+        else:
+            self.statusBar().showMessage(text, 10000 if level == "warning" else 6000)
 
-            if records:
-                self.voltage_card.set_value(records[-1].voltage)
-                self.current_card.set_value(records[-1].current)
-                self.power_card.set_value(records[-1].power)
-                self.avg_power_card.set_value(self._calculate_avg_power())
-            
-            self.samples_label.setText(f"Samples: {len(records):,}")
-            self.status_label.setText(f"● Imported: {Path(path).name}")
-            self.status_label.setStyleSheet(f"color: {self.theme.accent_primary};")
-            
-            # Calculate duration for message
-            if len(records) >= 2:
-                duration = records[-1].unix_time - records[0].unix_time
-                duration_str = f"{duration:.1f}s" if duration < 60 else f"{duration/60:.1f}m"
-            else:
-                duration_str = "N/A"
-            
-            QtWidgets.QMessageBox.information(
-                self, "Import Successful",
-                f"Imported {len(records):,} samples\n"
-                f"Duration: {duration_str}\n"
-                f"From: {Path(path).name}"
-            )
-            
-        except FileNotFoundError as e:
-            QtWidgets.QMessageBox.critical(self, "Error", str(e))
-        except ValueError as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Import Error", 
-                f"Could not parse CSV file:\n{e}"
-            )
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Error", 
-                f"Unexpected error during import:\n{e}"
-            )
-    
-    def _export_csv(self) -> None:
-        records = self._get_selected_records()
-        if not records:
-            QtWidgets.QMessageBox.warning(self, "Error", "No data to export.")
+    def _on_cursor(self, t: float, v: float, i: float, p: float) -> None:
+        from ..export.units import format_si
+        self.cursor_label.setText(
+            f"t {t:.4f} s   V {format_si(v, 'V')}   I {format_si(i, 'A')}   P {format_si(p, 'W')}")
+
+    def _on_setting_changed(self, name: str) -> None:
+        s = self.settings
+        if name in _REBUILD_KEYS:
+            self._apply_language()
+            idx = self._page_index
+            self.rebuild_ui()
+            self._show_page(idx)
+            if name != "*":
+                return
+            # Restore defaults: also apply what the rebuild does not cover.
+            self.frame_timer.start(int(1000 / s.plot_fps))
+            self.ctrl.apply_calibration()
+            self.cpu_bar.setVisible(s.show_cpu_usage)
+            self.cpu_pct.setVisible(s.show_cpu_usage)
             return
-        
-        default_name = f"measurement_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export CSV", default_name, "CSV Files (*.csv)"
-        )
-        
-        if not path:
-            return
-        
-        # Run export with progress dialog
-        self._run_export(
-            lambda: self.report_generator.export_csv(Path(path), records, self.settings.csv_separator),
-            f"Exported {len(records):,} samples to:\n{path}",
-            "Exporting CSV..."
-        )
-    
-    def _export_pdf(self) -> None:
-        records = self._get_selected_records()
-        if len(records) < 2:
-            QtWidgets.QMessageBox.warning(self, "Error", "Need at least 2 samples.")
-            return
-        
-        stats = Statistics.from_records(records)
-        if not stats:
-            QtWidgets.QMessageBox.warning(self, "Error", "Could not calculate statistics.")
-            return
-        
-        default_name = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export PDF", default_name, "PDF Files (*.pdf)"
-        )
-        
-        if not path:
-            return
-        
-        summary = (
-            f"Report generated!\n\n"
-            f"Samples: {stats.count:,}\n"
-            f"Duration: {stats.duration_seconds:.1f}s\n"
-            f"Avg Power: {stats.power_avg:.4f} W\n"
-            f"Energy: {stats.energy_wh*1000:.4f} mWh\n\n"
-            f"Saved to:\n{path}"
-        )
-        
-        # Run export with progress dialog
-        self._run_export(
-            lambda: self.report_generator.export_pdf(Path(path), stats, records),
-            summary,
-            "Generating PDF report..."
-        )
-    
-    def _run_export(self, export_func, success_msg: str, progress_msg: str) -> None:
-        """Run export function in background thread with progress dialog."""
-        from PySide6.QtCore import QThread, Signal
-        
-        class ExportWorker(QThread):
-            finished = Signal(bool, str)  # success, error_message
-            
-            def __init__(self, func):
-                super().__init__()
-                self.func = func
-            
-            def run(self):
-                try:
-                    self.func()
-                    self.finished.emit(True, "")
-                except Exception as e:
-                    self.finished.emit(False, str(e))
-        
-        progress = QtWidgets.QProgressDialog(progress_msg, None, 0, 0, self)
-        progress.setWindowTitle("Exporting")
-        progress.setWindowModality(QtCore.Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setCancelButton(None)
-        progress.show()
-        
-        def on_finished(success: bool, error: str):
-            progress.close()
-            worker.deleteLater()
-            if success:
-                QtWidgets.QMessageBox.information(self, "Success", success_msg)
-            else:
-                QtWidgets.QMessageBox.critical(self, "Error", f"Export failed: {error}")
-        
-        worker = ExportWorker(export_func)
-        worker.finished.connect(on_finished)
-        worker.start()
-    
-    # -------------------------------------------------------------------------
-    # Cleanup
-    # -------------------------------------------------------------------------
-    
+        if name == "plot_fps":
+            self.frame_timer.start(int(1000 / s.plot_fps))
+        if name == "show_cpu_usage":
+            self.cpu_bar.setVisible(s.show_cpu_usage)
+            self.cpu_pct.setVisible(s.show_cpu_usage)
+        if name == "time_window_s":
+            self.live.plot.set_window_seconds(s.time_window_s)
+            self.live._sync_window_combo(s.time_window_s)
+        if name in ("show_grid", "grid_alpha", "show_crosshair", "line_width", "antialias",
+                    "unit_mode", "show_voltage", "show_current", "show_power"):
+            self.live.apply_settings(s)
+            self.analysis.apply_settings(s)
+        if name in ("unit_mode", "value_decimals", "avg_power_mode", "avg_window_s"):
+            self.live.update_metrics()
+        if name == "spectrum_signal":
+            self.analysis.sync_spectrum_signal()
+
+    # ------------------------------------------------------------ window
+
+    def _restore_geometry(self) -> None:
+        qs = QtCore.QSettings("EdgePowerMeter", "EdgePowerMeter")
+        geo = qs.value("window/geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(1440, 900)
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if self.reader:
-            self.reader.stop(self.STOP_TIMEOUT_MS)
+        if self.files.busy:
+            QtWidgets.QMessageBox.information(self, APP_NAME, tr("Please wait for the export to finish."))
+            event.ignore()
+            return
+        if self.ctrl.has_unsaved_data and self.settings.confirm_discard and len(self.ctrl.store):
+            if not confirm(self, tr("Unsaved data"),
+                           tr("The recording has not been exported. Quit anyway?"),
+                           tr("Quit"), tr("Cancel")):
+                event.ignore()
+                return
+        QtCore.QSettings("EdgePowerMeter", "EdgePowerMeter").setValue(
+            "window/geometry", self.saveGeometry())
+        self.ctrl.shutdown()
+        self.settings.save()
         event.accept()

@@ -1,0 +1,4 @@
+# Dev-only: local machine translation for tools/i18n/translate.py.
+# Not needed by the app at runtime (it only reads app/i18n/locales/*.json).
+ctranslate2>=4.0,<5
+sentencepiece>=0.2,<0.3

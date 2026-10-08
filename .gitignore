@@ -168,3 +168,4 @@ parts/
 prime/
 stage/
 snap/.snapcraft/
+tools/i18n/.venv/

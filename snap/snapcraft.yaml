@@ -1,5 +1,5 @@
 name: edgepowermeter
-version: '1.7.2'
+version: '2.0.0'
 title: EdgePowerMeter
 summary: Real-time power analyser for embedded AI workloads
 description: |
@@ -8,12 +8,18 @@ description: |
   inference workloads. Perfect for benchmarking FPS-per-Watt efficiency.
 
   Features:
-  - Real-time voltage, current, and power graphs
-  - OpenGL accelerated rendering for smooth 60+ FPS
-  - CSV data export with full measurement history
-  - Professional PDF reports with graphs
-  - Dark and Light theme support
-  - Works with INA226-based power monitors
+  - Real-time voltage, current and power plots, device-clock time base
+  - Markers, segment statistics and FPS/W benchmark figures
+  - Continuous crash-safe recording to CSV, CSV import/export, PDF reports
+  - Power supply quality and frequency spectrum analysis
+  - Remote sensor configuration, clock sync and calibration (firmware 2.x)
+  - English, Italian, Spanish, French and German user interface
+  - Dark, light or system theme
+
+  Recordings are saved in Documents/EdgePowerMeter of your home folder.
+  Connect the serial interfaces once after installing:
+    sudo snap connect edgepowermeter:raw-usb
+    sudo snap connect edgepowermeter:hardware-observe
 
 license: Apache-2.0
 website: https://github.com/DanielRossi1/EdgePowerMeter
@@ -44,14 +50,19 @@ parts:
   edgepowermeter:
     plugin: python
     source: .
+    # A plain local pull copies the whole project folder, including untracked
+    # local folders (.venv, build/, dist/, tools/i18n/.venv: gigabytes, copied
+    # twice). Only the files needed to build the Python package are pulled.
+    override-pull: |
+      cp -r "$CRAFT_PROJECT_DIR/app" "$CRAFT_PROJECT_DIR/pyproject.toml" \
+            "$CRAFT_PROJECT_DIR/README.md" "$CRAFT_PROJECT_DIR/LICENSE" "$CRAFT_PART_SRC/"
+      find "$CRAFT_PART_SRC/app" -name "__pycache__" -type d -prune -exec rm -rf {} +
     python-packages:
-      - PySide6>=6.4.0
+      - PySide6-Essentials>=6.4.0
       - pyqtgraph>=0.13.0
       - pyserial>=3.5
       - reportlab>=4.0.0
       - numpy>=1.20.0
-      - scipy>=1.7.0
-      - matplotlib>=3.5.0
       - PyOpenGL>=3.1.0
     stage-packages:
       - libgl1

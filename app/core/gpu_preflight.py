@@ -48,10 +48,31 @@ def _env_for_mode(mode: str) -> Dict[str, str]:
     return env
 
 
+# Set in the probe subprocess's environment. app.main checks it before doing
+# anything else, so a probe can never start the full application.
+PROBE_ENV_VAR = "EPM_GPU_PROBE"
+
+
+def _frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _probe_command() -> list:
+    # In a PyInstaller build sys.executable is the application itself and
+    # "-m" means nothing to it: without the env-var guard in app.main every
+    # probe started another full app, which probed again (runaway processes,
+    # and the probe always "failed" -> software rendering cached).
+    if _frozen():
+        return [sys.executable]
+    return [sys.executable, "-m", "app.core.gpu_probe"]
+
+
 def _run_probe(env: Dict[str, str], label: str) -> bool:
+    env = dict(env)
+    env[PROBE_ENV_VAR] = "1"
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "app.core.gpu_probe"],
+            _probe_command(),
             env=env, timeout=_PROBE_TIMEOUT_S, capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -70,7 +91,9 @@ def _reexec(mode: str) -> None:
     env = _env_for_mode(mode)
     env[_MODE_ENV_VAR] = mode
     try:
-        os.execve(sys.executable, [sys.executable] + sys.argv, env)
+        # Frozen builds: argv[0] is the executable itself, do not pass it twice.
+        args = sys.argv[1:] if _frozen() else sys.argv
+        os.execve(sys.executable, [sys.executable] + args, env)
     except OSError as e:
         # Can't replace the process image - apply what we can in-place and
         # keep going rather than crashing. The GL env vars may arrive too

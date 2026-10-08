@@ -1,234 +1,181 @@
 """Power supply quality analysis for DC systems.
 
-Provides metrics to evaluate DC power supply performance:
-- Voltage regulation and ripple
-- Load regulation
-- Stability and noise analysis
+Metrics to evaluate a DC supply feeding the device under test:
+- voltage regulation, peak-to-peak ripple and RMS noise
+- load regulation and settling time after the first significant load step
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, Tuple
+
 import numpy as np
 
-if TYPE_CHECKING:
-    from .measurement import MeasurementRecord
+from ..i18n import tr
+from .samples import Samples
+
+# Rating identifiers (stable, untranslated); use rating_label() for display.
+RATING_EXCELLENT = "excellent"
+RATING_GOOD = "good"
+RATING_FAIR = "fair"
+RATING_POOR = "poor"
+
+
+def rating_label(rating: str) -> str:
+    return {
+        RATING_EXCELLENT: tr("Excellent"),
+        RATING_GOOD: tr("Good"),
+        RATING_FAIR: tr("Fair"),
+        RATING_POOR: tr("Poor"),
+    }.get(rating, rating)
 
 
 @dataclass
 class PowerSupplyQuality:
     """Power supply quality metrics for DC systems."""
-    # Voltage regulation
-    nominal_voltage: float  # Expected/average voltage (V)
-    min_voltage: float  # Minimum voltage observed (V)
-    max_voltage: float  # Maximum voltage observed (V)
-    voltage_ripple_percent: float  # Peak-to-peak variation as % of nominal
-    voltage_ripple_mv: float  # Peak-to-peak variation in mV
-    
-    # Load regulation (if load changes detected)
-    load_regulation_percent: Optional[float] = None  # Voltage change per load change
-    settling_time_ms: Optional[float] = None  # Time to stabilize after load change
-    
-    # Stability metrics
-    rms_noise: float = 0.0  # RMS noise/variation (V)
-    std_deviation: float = 0.0  # Standard deviation (V)
-    stability_rating: str = "Unknown"  # Excellent/Good/Fair/Poor
-    
-    # Compliance flags
-    meets_1percent_spec: bool = False  # <1% ripple (switching PSU typical)
-    meets_01percent_spec: bool = False  # <0.1% ripple (linear PSU typical)
-    meets_005percent_spec: bool = False  # <0.05% ripple (precision PSU)
+
+    nominal_voltage: float
+    min_voltage: float
+    max_voltage: float
+    voltage_ripple_percent: float
+    voltage_ripple_mv: float
+    load_regulation_percent: Optional[float] = None
+    settling_time_ms: Optional[float] = None
+    rms_noise: float = 0.0
+    std_deviation: float = 0.0
+    stability_rating: str = RATING_POOR
+    meets_1percent_spec: bool = False
+    meets_01percent_spec: bool = False
+    meets_005percent_spec: bool = False
 
 
 class PowerSupplyAnalyzer:
     """Analyzer for DC power supply quality."""
-    
-    # Quality rating thresholds (% of nominal voltage)
-    EXCELLENT_THRESHOLD = 0.05  # <0.05% ripple
-    GOOD_THRESHOLD = 0.1        # <0.1% ripple
-    FAIR_THRESHOLD = 1.0        # <1% ripple
-    # >1% is Poor
-    
-    def analyze_voltage_quality(self, records: List['MeasurementRecord'],
-                               nominal_voltage: Optional[float] = None) -> Optional[PowerSupplyQuality]:
-        """Analyze DC voltage quality from measurement records.
-        
-        Args:
-            records: Measurement records
-            nominal_voltage: Expected nominal voltage (V). If None, uses mean.
-            
-        Returns:
-            PowerSupplyQuality object or None if insufficient data
-        """
-        if len(records) < 10:
+
+    EXCELLENT_THRESHOLD = 0.05  # % ripple
+    GOOD_THRESHOLD = 0.1
+    FAIR_THRESHOLD = 1.0
+
+    MIN_SAMPLES = 10
+    SETTLING_WINDOW_S = 0.5     # how long after a step we look for settling
+
+    def analyze_voltage_quality(self, s: Samples,
+                                nominal_voltage: Optional[float] = None
+                                ) -> Optional[PowerSupplyQuality]:
+        if len(s) < self.MIN_SAMPLES:
             return None
-        
-        # Extract voltage data
-        voltages = np.array([r.voltage for r in records])
-        
-        # Calculate basic statistics
-        v_min = np.min(voltages)
-        v_max = np.max(voltages)
-        v_mean = np.mean(voltages)
-        v_std = np.std(voltages)
-        
-        # Use mean as nominal if not specified
-        if nominal_voltage is None:
-            nominal_voltage = v_mean
-        
-        # Calculate ripple (peak-to-peak variation)
-        voltage_ripple_v = v_max - v_min
-        voltage_ripple_mv = voltage_ripple_v * 1000.0
-        # Guard against a ~0 V rail (no source connected): a relative ripple is
-        # undefined there, so report 0% instead of producing inf/NaN.
-        if abs(nominal_voltage) < 1e-9:
-            voltage_ripple_percent = 0.0
-        else:
-            voltage_ripple_percent = (voltage_ripple_v / abs(nominal_voltage)) * 100.0
-        
-        # Calculate RMS noise (variation from mean)
-        rms_noise = np.sqrt(np.mean((voltages - v_mean) ** 2))
-        
-        # Determine stability rating
-        ripple_pct = voltage_ripple_percent
+
+        v = s.v.astype(np.float64)
+        v_min, v_max = float(v.min()), float(v.max())
+        v_mean = float(v.mean())
+        v_std = float(v.std())
+        nominal = v_mean if nominal_voltage is None else float(nominal_voltage)
+
+        ripple_v = v_max - v_min
+        # A ~0 V rail (no source connected) has no meaningful relative ripple.
+        ripple_pct = 0.0 if abs(nominal) < 1e-9 else ripple_v / abs(nominal) * 100.0
+
         if ripple_pct < self.EXCELLENT_THRESHOLD:
-            stability_rating = "Excellent"
+            rating = RATING_EXCELLENT
         elif ripple_pct < self.GOOD_THRESHOLD:
-            stability_rating = "Good"
+            rating = RATING_GOOD
         elif ripple_pct < self.FAIR_THRESHOLD:
-            stability_rating = "Fair"
+            rating = RATING_FAIR
         else:
-            stability_rating = "Poor"
-        
-        # Check compliance with common specs
-        meets_1percent = voltage_ripple_percent < 1.0
-        meets_01percent = voltage_ripple_percent < 0.1
-        meets_005percent = voltage_ripple_percent < 0.05
-        
-        # Analyze load regulation (if we detect load changes)
-        load_regulation = None
-        settling_time = None
-        
-        currents = np.array([r.current for r in records])
-        if len(currents) > 10:
-            load_regulation, settling_time = self._analyze_load_regulation(
-                records, voltages, currents, nominal_voltage
-            )
-        
+            rating = RATING_POOR
+
+        load_reg, settling = self._analyze_load_step(s, v, nominal)
+
         return PowerSupplyQuality(
-            nominal_voltage=nominal_voltage,
+            nominal_voltage=nominal,
             min_voltage=v_min,
             max_voltage=v_max,
-            voltage_ripple_percent=voltage_ripple_percent,
-            voltage_ripple_mv=voltage_ripple_mv,
-            load_regulation_percent=load_regulation,
-            settling_time_ms=settling_time,
-            rms_noise=rms_noise,
+            voltage_ripple_percent=ripple_pct,
+            voltage_ripple_mv=ripple_v * 1000.0,
+            load_regulation_percent=load_reg,
+            settling_time_ms=settling,
+            rms_noise=float(np.sqrt(np.mean((v - v_mean) ** 2))),
             std_deviation=v_std,
-            stability_rating=stability_rating,
-            meets_1percent_spec=meets_1percent,
-            meets_01percent_spec=meets_01percent,
-            meets_005percent_spec=meets_005percent
+            stability_rating=rating,
+            meets_1percent_spec=ripple_pct < 1.0,
+            meets_01percent_spec=ripple_pct < 0.1,
+            meets_005percent_spec=ripple_pct < 0.05,
         )
-    
-    def _analyze_load_regulation(self, records: List['MeasurementRecord'],
-                                voltages: np.ndarray, currents: np.ndarray,
-                                nominal_voltage: float) -> tuple[Optional[float], Optional[float]]:
-        """Analyze load regulation by detecting load steps.
-        
-        Returns:
-            (load_regulation_percent, settling_time_ms) tuple
+
+    def _analyze_load_step(self, s: Samples, v: np.ndarray, nominal: float
+                           ) -> Tuple[Optional[float], Optional[float]]:
+        """Load regulation and settling time around the first load step.
+
+        A load step is a current change larger than 4 sigma of the sample to
+        sample current noise *and* larger than 10 % of the current range, so
+        that plain sensor noise on a constant load is not reported as a step.
+        Settling is measured in time (not samples), so the result does not
+        depend on the sample rate.
         """
-        # Detect significant current changes (load steps)
-        current_diff = np.abs(np.diff(currents))
-        threshold = np.std(currents) * 2.0  # 2 sigma threshold
-        
-        # Find load step indices
-        step_indices = np.where(current_diff > threshold)[0]
-        
-        if len(step_indices) == 0:
+        i = s.i.astype(np.float64)
+        t = s.t
+        if len(i) < 20:
             return None, None
-        
-        # Analyze first significant load step
-        step_idx = step_indices[0]
-        
-        # Get voltage before and after step
-        if step_idx < 5 or step_idx >= len(voltages) - 20:
+
+        di = np.diff(i)
+        noise = float(np.median(np.abs(di - np.median(di)))) * 1.4826  # robust sigma
+        span = float(i.max() - i.min())
+        threshold = max(4.0 * noise, 0.1 * span)
+        if span <= 0 or threshold <= 0:
             return None, None
-        
-        v_before = np.mean(voltages[max(0, step_idx-5):step_idx])
-        
-        # Find settling point (where voltage stabilizes)
-        window_size = 10
-        settling_idx = None
-        for i in range(step_idx + 1, min(step_idx + 100, len(voltages) - window_size)):
-            window = voltages[i:i+window_size]
-            if np.std(window) < 0.001:  # Voltage has stabilized
-                settling_idx = i
-                break
-        
-        if settling_idx is None:
-            # Use fixed window if no clear settling point
-            settling_idx = min(step_idx + 20, len(voltages) - 1)
-        
-        v_after = np.mean(voltages[settling_idx:settling_idx+5])
-        
-        # Calculate load regulation
-        voltage_change = abs(v_after - v_before)
-        if abs(nominal_voltage) < 1e-9:
-            load_regulation_percent = 0.0
-        else:
-            load_regulation_percent = (voltage_change / abs(nominal_voltage)) * 100.0
-        
-        # Calculate settling time
-        times = np.array([r.relative_time for r in records])
-        settling_time_ms = (times[settling_idx] - times[step_idx]) * 1000.0
-        
-        return load_regulation_percent, settling_time_ms
-    
+        steps = np.flatnonzero(np.abs(di) > threshold)
+        if not len(steps):
+            return None, None
+        k = int(steps[0]) + 1  # first sample after the step
+        if k < 5:
+            return None, None
+
+        t_step = t[k]
+        pre = v[max(0, k - 50):k]
+        v_before = float(pre.mean())
+        end = int(np.searchsorted(t, t_step + self.SETTLING_WINDOW_S))
+        post = v[k:end]
+        if len(post) < 10:
+            return None, None
+        tail = post[-max(5, len(post) // 5):]
+        v_after = float(tail.mean())
+        band = max(3.0 * float(tail.std()), 0.001 * abs(nominal), 1.25e-3)
+
+        outside = np.flatnonzero(np.abs(post - v_after) > band)
+        settle_idx = k + (int(outside[-1]) + 1 if len(outside) else 0)
+        settle_idx = min(settle_idx, len(t) - 1)
+
+        load_reg = 0.0 if abs(nominal) < 1e-9 else abs(v_after - v_before) / abs(nominal) * 100.0
+        return load_reg, float(t[settle_idx] - t_step) * 1000.0
+
     @staticmethod
-    def get_quality_recommendations(quality: PowerSupplyQuality) -> List[str]:
-        """Get recommendations based on power supply quality analysis.
-        
-        Args:
-            quality: PowerSupplyQuality analysis results
-            
-        Returns:
-            List of recommendation strings
-        """
-        recommendations = []
-        
-        if quality.stability_rating == "Excellent":
-            recommendations.append("✓ Excellent voltage stability - suitable for precision applications")
-        elif quality.stability_rating == "Good":
-            recommendations.append("✓ Good voltage stability - suitable for most applications")
-        elif quality.stability_rating == "Fair":
-            recommendations.append("⚠ Fair voltage stability - consider upgrading for sensitive loads")
-            recommendations.append("• Add output filtering capacitors to reduce ripple")
-        else:  # Poor
-            recommendations.append("✗ Poor voltage stability - not recommended for sensitive electronics")
-            recommendations.append("• Consider replacing power supply")
-            recommendations.append("• Add LC filter to output")
-            recommendations.append("• Check for loose connections or damaged components")
-        
-        # Load regulation feedback
-        if quality.load_regulation_percent is not None:
-            if quality.load_regulation_percent < 0.5:
-                recommendations.append("✓ Excellent load regulation")
-            elif quality.load_regulation_percent < 1.0:
-                recommendations.append("✓ Good load regulation")
-            elif quality.load_regulation_percent < 3.0:
-                recommendations.append("⚠ Fair load regulation - voltage drops under load")
+    def get_quality_recommendations(q: PowerSupplyQuality) -> List[str]:
+        rec: List[str] = []
+        if q.stability_rating == RATING_EXCELLENT:
+            rec.append(tr("Excellent voltage stability, suitable for precision applications."))
+        elif q.stability_rating == RATING_GOOD:
+            rec.append(tr("Good voltage stability, suitable for most applications."))
+        elif q.stability_rating == RATING_FAIR:
+            rec.append(tr("Fair voltage stability: consider a better supply for sensitive loads."))
+            rec.append(tr("Add output filtering capacitors to reduce ripple."))
+        else:
+            rec.append(tr("Poor voltage stability: not recommended for sensitive electronics."))
+            rec.append(tr("Check cables and connections, or add an LC filter on the output."))
+
+        if q.load_regulation_percent is not None:
+            if q.load_regulation_percent < 1.0:
+                rec.append(tr("Good load regulation."))
+            elif q.load_regulation_percent < 3.0:
+                rec.append(tr("Fair load regulation: the voltage drops under load."))
             else:
-                recommendations.append("✗ Poor load regulation - significant voltage drop under load")
-        
-        # Settling time feedback
-        if quality.settling_time_ms is not None:
-            if quality.settling_time_ms < 10:
-                recommendations.append("✓ Fast transient response (<10ms)")
-            elif quality.settling_time_ms < 100:
-                recommendations.append("✓ Good transient response (<100ms)")
+                rec.append(tr("Poor load regulation: significant voltage drop under load."))
+
+        if q.settling_time_ms is not None:
+            if q.settling_time_ms < 10:
+                rec.append(tr("Fast transient response (under 10 ms)."))
+            elif q.settling_time_ms < 100:
+                rec.append(tr("Good transient response (under 100 ms)."))
             else:
-                recommendations.append("⚠ Slow transient response - may affect dynamic loads")
-        
-        return recommendations
+                rec.append(tr("Slow transient response: may affect dynamic loads."))
+        return rec

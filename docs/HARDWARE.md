@@ -32,10 +32,10 @@ EdgePowerMeter is a precision power measurement device based on the INA226 curre
 | Input Voltage Range | 0 - 36V | Bus voltage measurement |
 | Current Range | ±3.2A | With 0.01Ω shunt |
 | Voltage Resolution | 1.25mV | 16-bit ADC |
-| Current Resolution | 0.1mA | Configurable LSB |
-| Power Calculation | Internal | V × I computed by INA226 |
-| Sampling Rate | ~100 Hz | Software configurable |
-| Interface | USB Serial | 115200 baud |
+| Current Resolution | 0.25mA | Shunt LSB 2.5µV / 0.01Ω |
+| Power Calculation | Host | V × I computed per sample from raw registers |
+| Sampling Rate | up to ~890 Hz | Set by INA226 averaging and conversion times (default 4 × (140+140) µs) |
+| Interface | Native USB-CDC | Protocol v2, see [PROTOCOL.md](PROTOCOL.md) |
 
 ---
 
@@ -155,13 +155,13 @@ The DS3231 SQW (Square Wave) output provides a precise 1Hz signal for millisecon
 | SQW | GPIO3 | A3 | 1Hz interrupt for time sync |
 
 **How it works:**
-1. DS3231 outputs a 1Hz square wave on SQW pin
-2. ESP32 captures the falling edge via interrupt
-3. At each pulse, the RTC time is read and cached
-4. Between pulses, `millis()` provides sub-second resolution
-5. Result: Millisecond-accurate timestamps with ±2ppm drift
+1. DS3231 outputs a 1Hz square wave on SQW pin; its falling edge marks the start of a new RTC second
+2. ESP32 captures the falling edge in an interrupt with `esp_timer_get_time()` (µs resolution)
+3. Shortly after, when the sampling loop has spare time, the RTC second is read and paired with the edge time: this is a *time anchor*
+4. Every sample carries the device µs timestamp of its conversion; the host maps it to wall-clock time through the latest anchor (in RAW mode the anchors are sent once per second as `T` lines)
+5. Result: µs-resolution sample timing with the DS3231's ±2ppm long-term accuracy
 
-This hybrid approach combines RTC accuracy with MCU timing precision.
+If no SQW edge is detected (pin not wired), the firmware falls back to polling the RTC seconds register around the expected boundary (≈ ms accuracy); the OLED status line then shows `RTC` instead of `SQW`.
 
 ### I²C Device Addresses
 
@@ -282,47 +282,91 @@ Refer to the schematic for exact connections:
 
 ---
 
+## Firmware
+
+The sketch lives in `firmware/` (version 2.x, serial protocol v2 documented in
+[PROTOCOL.md](PROTOCOL.md)).
+
+| File | Purpose |
+|------|---------|
+| `firmware.ino` | Main loop: sampling, serial output, command parser, NVS settings |
+| `INA226Lite.h/.cpp` | Minimal INA226 driver (raw registers, conversion-ready polling) |
+| `PrecisionTime.h/.cpp` | DS3231 time anchors (SQW interrupt, polling fallback) |
+| `OLEDStatus.h/.cpp` | SSD1306 display with non-blocking chunked frame transfer |
+
+**Required libraries:** `RTClib`, `Adafruit SSD1306`, `Adafruit GFX Library`
+(and their dependency `Adafruit BusIO`). The Rob Tillaart `INA226` library is
+**no longer required**.
+
+**Build** (board *ESP32C3 Dev Module*, *USB CDC On Boot: Enabled*):
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc firmware
+arduino-cli upload -p /dev/ttyACM0 --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc firmware
+```
+
+**How sampling works:**
+- The INA226 runs in continuous shunt+bus mode. The firmware polls its
+  conversion-ready flag (the ALERT pin is not wired) and reads the shunt and
+  bus registers only when a new conversion is available, so every sample is a
+  fresh, non-duplicated conversion with its own µs timestamp.
+- Polling starts at ~85% of the conversion period; the time before that is used
+  for RTC reads and for the OLED, whose 512-byte frames are sent in 16-byte
+  chunks between conversions instead of one ~13 ms blocking transfer.
+- If the host stops reading, data lines are dropped instead of blocking; the
+  sequence number keeps counting so the app can report lost samples.
+- `loop()` never returns: the Arduino core otherwise sleeps 5 ms every 2 s
+  between `loop()` calls on single-core chips (`yieldIfNecessary()`), which
+  dropped ~4 conversions each time. The idle-task watchdog is disabled for
+  this reason. Measured on hardware (default settings, no SQW): 0 lines lost
+  and ~0.015 % conversions missed, versus ~0.4 % before.
+- At boot the device prints `#`-prefixed info lines and the legacy CSV header,
+  then streams in CSV mode until the app switches it to RAW mode.
+
+---
+
 ## Calibration
+
+With firmware 2.x the device streams the **raw** INA226 shunt and bus
+registers (RAW mode); conversion to volts/amps/watts and all calibration
+(shunt resistance, current offset, gain factors) happen in the desktop app,
+so no reflashing is needed to calibrate.
 
 ### Shunt Resistance Calibration
 
-1. Measure actual shunt resistance with precision multimeter
-2. Update firmware configuration:
-   ```cpp
-   namespace Config {
-       constexpr float SHUNT_RESISTANCE = 0.0102f; // Measured value
-   }
-   ```
+1. Measure the actual shunt resistance with a precision multimeter (4-wire if possible)
+2. Enter the measured value in the desktop app settings
+3. Optionally store it on the device too (used only for the OLED and the legacy CSV output):
+   `SET SHUNT 0.0102` followed by `SAVE`
 
 ### Current Zero Offset
 
-1. Remove load (open circuit)
-2. Observe current reading
-3. Adjust offset in firmware:
-   ```cpp
-   constexpr float CURRENT_ZERO_OFFSET_MA = -0.5f; // Adjust as needed
-   ```
+1. Remove the load (open circuit)
+2. Use the app's zero-offset calibration, which subtracts the measured idle current
 
 ### Voltage Scaling
 
-1. Apply known voltage (use precision source)
-2. Compare reading with reference
-3. Adjust scaling factor if needed:
-   ```cpp
-   constexpr uint16_t BUS_V_SCALING_E4 = 10050; // Fine tune
-   ```
+1. Apply a known voltage (precision source)
+2. Compare the reading with the reference and set the voltage gain in the app
 
-### INA226 Averaging
+### INA226 Averaging and Conversion Time
 
-Configure averaging for your application:
+The sample period is `(VBUSCT + VSHCT) × AVG`. Configure it from the app or
+with serial commands (`SET AVG <n>`, `SET VCT <µs>`, `SET ICT <µs>`, then
+`SAVE` to keep it across reboots):
 
-| Setting | Samples | Noise Reduction | Response Time |
-|---------|---------|-----------------|---------------|
-| INA226_1_SAMPLE | 1 | None | Fastest |
-| INA226_4_SAMPLES | 4 | Low | Fast |
-| INA226_16_SAMPLES | 16 | Medium | Moderate |
-| INA226_64_SAMPLES | 64 | High | Slow |
-| INA226_128_SAMPLES | 128 | Very High | Very Slow |
+| AVG | Conversion time (each) | Period | Rate | Noise |
+|-----|------------------------|--------|------|-------|
+| 1 | 140 µs | 280 µs | ~3.6 kHz* | Highest |
+| 4 (default) | 140 µs | 1.12 ms | ~890 Hz | Low |
+| 16 | 140 µs | 4.48 ms | ~220 Hz | Lower |
+| 16 | 1100 µs | 35.2 ms | ~28 Hz | Very low |
+| 64 | 1100 µs | 140.8 ms | ~7 Hz | Lowest |
+
+\* Faster than the firmware can read and transmit every conversion: some
+conversions are skipped (visible as timing gaps on the host). Periods of
+about 1 ms or more leave time for the OLED refresh; with shorter periods the
+OLED stops updating while sampling.
 
 ---
 
@@ -332,8 +376,9 @@ Configure averaging for your application:
 
 1. Check USB connection
 2. Verify correct COM port selected
-3. Ensure baud rate is 115200
+3. Make sure the firmware was built with **USB CDC On Boot: Enabled** (the SuperMini has no USB-UART bridge)
 4. Check ESP32-C3 is powered (LED on)
+5. Data output may be paused (`SET STREAM 1` resumes it)
 
 ### I²C Devices Not Found
 
@@ -376,9 +421,8 @@ Configure averaging for your application:
 ### RTC Wrong Time
 
 1. Check RTC battery
-2. Set `FORCE_RTC_UPDATE = true` in firmware
-3. Recompile and upload
-4. Time will sync on boot
+2. Sync the clock from the desktop app (or send `SYNC YYYY-MM-DD HH:MM:SS` over serial)
+3. Alternatively set `FORCE_RTC_UPDATE = true` in the firmware, upload, then flash back to `false`
 
 ### Power Measurement Inaccurate
 

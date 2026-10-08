@@ -1,15 +1,19 @@
 """Serial communication package for EdgePowerMeter."""
 
 from .config import SerialConfig
-from .parser import MeasurementParser
-from .handler import SerialPortHandler
-from .serial_reader import SerialReader
-from .sampler import SampleRateController
+from .handler import DeviceDisconnected, SerialPortHandler
+from .protocol import Calibration, DeviceConfig, DeviceInfo, StreamDecoder
+from .serial_reader import PROTO_LEGACY, PROTO_V2, SerialReader
 
 __all__ = [
     "SerialConfig",
-    "MeasurementParser",
     "SerialPortHandler",
+    "DeviceDisconnected",
+    "Calibration",
+    "DeviceConfig",
+    "DeviceInfo",
+    "StreamDecoder",
     "SerialReader",
-    "SampleRateController",
+    "PROTO_LEGACY",
+    "PROTO_V2",
 ]

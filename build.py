@@ -58,31 +58,27 @@ def build_pyinstaller():
         "--icon", str(icon_path),
         # Include assets folder for runtime icon
         "--add-data", f"{assets_path}{data_sep}assets",
+        # Translation catalogs (read by app.i18n at runtime)
+        "--add-data", f"{ROOT / 'app' / 'i18n' / 'locales'}{data_sep}app/i18n/locales",
         # Hidden imports for PySide6 and pyqtgraph
         "--hidden-import", "PySide6.QtCore",
         "--hidden-import", "PySide6.QtGui", 
         "--hidden-import", "PySide6.QtWidgets",
+        "--hidden-import", "PySide6.QtSvg",
         "--hidden-import", "pyqtgraph",
         "--hidden-import", "numpy",
         "--hidden-import", "serial",
         "--hidden-import", "reportlab",
-        "--hidden-import", "matplotlib",
-        "--hidden-import", "matplotlib.pyplot",
-        "--hidden-import", "matplotlib.dates",
-        "--hidden-import", "matplotlib.backends.backend_agg",
-        "--hidden-import", "PIL",
-        "--hidden-import", "PIL.Image",
         "--hidden-import", "OpenGL",
         "--hidden-import", "OpenGL.GL",
         "--hidden-import", "OpenGL.platform.glx",
         "--hidden-import", "OpenGL.platform.egl",
-        "--hidden-import", "scipy",
-        "--hidden-import", "scipy.fft",
-        # Collect all matplotlib and PIL data files
-        "--collect-all", "matplotlib",
-        "--collect-all", "PIL",
         # Exclude unnecessary modules to reduce size
         "--exclude-module", "tkinter",
+        # Not used since 1.8 (PDF charts are drawn with reportlab); keep them
+        # out even if installed in the build environment.
+        "--exclude-module", "matplotlib",
+        "--exclude-module", "scipy",
         "--exclude-module", "torch",
         "--exclude-module", "torchvision",
         "--exclude-module", "ultralytics",
@@ -171,6 +167,7 @@ Version: {VERSION}
 Section: electronics
 Priority: optional
 Architecture: {arch}
+Depends: libxcb-cursor0, libxkbcommon-x11-0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-render-util0, libxcb-xinerama0, libegl1
 Maintainer: {AUTHOR}
 Description: {DESCRIPTION}
  EdgePowerMeter is a real-time power monitoring application
@@ -198,8 +195,10 @@ Upstream-Name: {APP_NAME}
 Upstream-Contact: {AUTHOR}
 
 Files: *
-Copyright: 2025 {AUTHOR}
-License: MIT
+Copyright: 2025-2026 {AUTHOR}
+License: Apache-2.0
+ On Debian systems the full text of the Apache License 2.0 can be found in
+ /usr/share/common-licenses/Apache-2.0.
 """
     (deb_dir / "usr" / "share" / "doc" / APP_NAME.lower() / "copyright").write_text(copyright_content)
     

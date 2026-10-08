@@ -1,17 +1,8 @@
-"""Reusable UI widgets for EdgePowerMeter application.
+"""Reusable UI widgets for EdgePowerMeter."""
 
-This module provides modular, reusable UI components:
-
-- StatCard: Value display card with color theming
-- PlotWidget: Three-panel plot for V/I/P data with region selector
-- PlotBuffers: Thread-safe data buffering for real-time plots
-- PortDiscovery: Serial port detection and monitoring
-"""
-
-from .stat_card import StatCard
-from .plot_widget import PlotWidget
-from .plot_buffers import PlotBuffers
-from .port_discovery import PortDiscovery
 from .cpu_bar import CPUBar
+from .metric_card import MetricCard
+from .plot_widget import PlotWidget
+from .port_discovery import PortDiscovery
 
-__all__ = ['StatCard', 'PlotWidget', 'PlotBuffers', 'PortDiscovery', 'CPUBar']
+__all__ = ["CPUBar", "MetricCard", "PlotWidget", "PortDiscovery"]

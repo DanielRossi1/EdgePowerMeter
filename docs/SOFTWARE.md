@@ -1,605 +1,261 @@
 # EdgePowerMeter Software Documentation
 
-This document provides detailed information about the EdgePowerMeter desktop application.
+Desktop application (Python, PySide6/Qt 6, pyqtgraph) for the EdgePowerMeter
+hardware. This document describes the architecture and the main modules.
+The serial protocol is specified in [PROTOCOL.md](PROTOCOL.md), the firmware
+and hardware in [HARDWARE.md](HARDWARE.md), packaging in [BUILD.md](BUILD.md).
 
 ## Table of Contents
 
-1. [Architecture](#architecture)
-2. [Modules](#modules)
-3. [Serial Communication](#serial-communication)
-4. [User Interface](#user-interface)
-5. [Data Processing](#data-processing)
-6. [Export Formats](#export-formats)
-7. [Themes](#themes)
-8. [Settings](#settings)
+- [Architecture](#architecture)
+- [Data path](#data-path)
+- [Modules](#modules)
+- [User interface](#user-interface)
+- [Translations](#translations)
+- [Settings](#settings)
+- [Export formats](#export-formats)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Architecture
 
-The application follows a modular architecture with clear separation of concerns:
-
 ```
-app/
-├── main.py              # Application entry point
-├── version.py           # Version information
-├── core/                # Core analysis modules
-│   ├── __init__.py
-│   ├── harmonic_analysis.py        # FFT spectrum analysis for DC systems
-│   ├── power_supply_quality.py    # PSU quality metrics (ripple, regulation)
-│   ├── measurement.py              # Measurement dataclass
-│   ├── settings.py                 # Settings dataclass
-│   └── statistics.py               # Statistics calculations
-├── serial/
-│   ├── __init__.py
-│   ├── serial_reader.py            # Serial communication (921600 baud)
-│   ├── sampler.py                  # Sample rate controller
-│   ├── parser.py                   # Data parsing
-│   └── handler.py                  # Serial port handling
-├── export/
-│   ├── __init__.py
-│   ├── csv_importer.py             # CSV import/export
-│   └── pdf_report.py               # PDF generation with graphs
-└── ui/
-    ├── __init__.py
-    ├── main_window.py              # Main GUI window
-    ├── dialogs/
-    │   └── settings_dialog.py      # Settings UI
-    ├── theme/
-    │   └── colors.py               # Theme definitions
-    └── widgets/                    # Reusable UI components
-        ├── __init__.py
-        ├── plot_buffers.py         # Data buffering for plots
-        ├── plot_widget.py          # Three-panel graph widget
-        ├── stat_card.py            # Statistics display card
-        └── port_discovery.py       # Serial port detection
+            USB-CDC                    reader thread                      GUI thread
+┌──────────┐  bytes  ┌───────────────────────────────────┐  Samples   ┌──────────────────────────┐
+│ ESP32-C3 │ ──────► │ SerialPortHandler (select/os.read)│  batches   │ AcquisitionController     │
+│ firmware │ ◄────── │ StreamDecoder  (RAW / legacy CSV) │ ─────────► │  SampleStore (numpy)      │
+└──────────┘ commands│ SerialReader   (handshake, watchdog,│  ≤60/s    │  RunningStats             │
+                     │                 commands, batching)│           │  reconnect logic          │
+                     └───────────────────────────────────┘           └────────────┬─────────────┘
+                                                                                  │ signals
+                                          ┌───────────────┬───────────────┬───────┴──────┬──────────────┐
+                                          │ LivePage      │ AnalysisPage  │ DevicePage   │ SettingsPage │
+                                          │ plots, tiles  │ selection,    │ INA226 cfg,  │ all options  │
+                                          │               │ PSU, spectrum │ clock, calib │              │
+                                          └───────────────┴───────────────┴──────────────┴──────────────┘
 ```
 
-### Design Principles
+Design rules:
 
-- **Clean Code**: Modular design with single responsibility
-- **Type Hints**: Full type annotations for better IDE support
-- **Dataclasses**: Used for configuration and data structures
-- **Separation**: UI, serial communication, and business logic are separated
+- **No per-sample work on the GUI thread.** The reader decodes in bulk and
+  emits one `Samples` batch per frame; plots redraw at a fixed rate (default
+  30 FPS) and only the visible slice is handed to pyqtgraph, which
+  peak-downsamples it to the pixel width.
+- **Columnar storage.** Samples live in growable numpy columns
+  (`SampleStore`, 28 bytes/sample), so hours of 1 kHz data stay in the
+  hundreds of MB and every statistic is vectorized.
+- **Device time.** With firmware 2.x the time axis comes from the device's µs
+  clock, not from when data reached the PC, so USB and GUI latency do not
+  distort sample spacing, energy integration or the spectrum.
+- **The controller has no widgets.** Connection, reconnection and
+  data-retention rules live in `AcquisitionController` and are tested headless.
+
+---
+
+## Data path
+
+1. `SerialPortHandler` opens the port (raw termios file descriptor on Linux,
+   pyserial elsewhere) and returns whatever bytes are available.
+2. `SerialReader` sends `HELLO` until firmware 2.x answers, then `GET`,
+   `MODE RAW` and (optionally) `SYNC` at the next second boundary. If only
+   legacy CSV lines arrive for 2.5 s it falls back to firmware-1.x mode.
+3. `StreamDecoder` splits lines, converts raw INA226 registers with the
+   host-side `Calibration` (shunt, gain, offset), maps device time to wall
+   clock using the `T` anchors, counts lost samples (sequence gaps) and missed
+   conversions (time gaps), and optionally block-averages N samples.
+4. `AcquisitionController` appends batches to the `SampleStore`, updates
+   `RunningStats` (energy/charge integration skips disconnection gaps), and
+   handles state changes.
+
+Connection rules (see `app/ui/controller.py`):
+
+| Event | Behaviour |
+|-------|-----------|
+| Start | New recording; the UI asks before discarding unsaved data. |
+| Stop | Final. Nothing restarts the acquisition automatically. |
+| USB unplugged / port hung up | Data kept. With auto-reconnect, the port is polled every second; on return the recording continues and the time axis is bridged with the real outage duration. |
+| No data for the configured timeout | Acquisition stops with an explanatory error. |
 
 ---
 
 ## Modules
 
-### `app/serial/reader.py`
-
-Handles all serial port communication with the EdgePowerMeter hardware.
-
-#### Classes
-
-**`Measurement`** (dataclass)
-```python
-@dataclass
-class Measurement:
-    timestamp: datetime
-    voltage: float    # Volts
-    current: float    # Milliamps
-    power: float      # Milliwatts
-```
-
-**`SerialConfig`** (dataclass)
-```python
-@dataclass
-class SerialConfig:
-    port: str
-    baud: int = 921600  # High-speed serial for fast data transfer
-    timeout: float = 0.1
-```
-
-**`SerialReader`**
-- Manages serial connection lifecycle
-- Parses CSV data from firmware
-- Emits measurements via callback
-
-#### Usage Example
-
-```python
-from app.serial.reader import SerialReader, SerialConfig
-
-def on_measurement(m: Measurement):
-    print(f"V={m.voltage:.3f}V, I={m.current:.2f}mA, P={m.power:.2f}mW")
-
-config = SerialConfig(port="/dev/ttyUSB0")
-reader = SerialReader(config, callback=on_measurement)
-reader.start()
-```
+| Module | Purpose |
+|--------|---------|
+| `app/core/samples.py` | `Samples` (immutable columnar view) and `SampleStore` (append-only growable store). |
+| `app/core/statistics.py` | `Statistics.from_samples()` (vectorized), `RunningStats` (incremental), trapezoidal `integrate_energy()` with gap skipping. |
+| `app/core/power_supply_quality.py` | Ripple, RMS noise, stability rating, load regulation and settling time (time-based, sample-rate independent). |
+| `app/core/markers.py` | `MarkerList` (ids, segments between markers, append-only CSV lines). |
+| `app/core/benchmark.py` | Energy per inference, inferences per joule, throughput per watt (gross / net of idle power). |
+| `app/export/recorder.py` | `RecordingWriter`: continuous, crash-safe CSV recording. |
+| `app/ui/marker_actions.py` | Shared marker gestures (key, button, context menu, rename, drag). |
+| `app/core/spectrum.py` | FFT of the load variation on a uniform resampled grid, Hann window, amplitude-correct peaks. |
+| `app/core/settings.py` | `AppSettings` dataclass, QSettings persistence, validation, migration from 1.x. |
+| `app/serial/protocol.py` | `StreamDecoder`, `Calibration`, `DeviceConfig`, `DeviceInfo`. Qt-free and unit-tested. |
+| `app/serial/serial_reader.py` | `SerialReader` QThread: handshake, commands, clock sync, watchdog, batching. |
+| `app/serial/handler.py` | Low-level port I/O; raises `DeviceDisconnected` on hang-up. |
+| `app/export/csv_io.py` | CSV export (separator, decimal comma, date/time or Unix time) and import (all layouts written by any app version or by the firmware). |
+| `app/export/pdf_report.py` | PDF report with vector charts drawn by reportlab (no matplotlib). |
+| `app/export/units.py` | Engineering-prefix formatting shared by UI and reports. |
+| `app/i18n/` | Runtime translation lookup (`tr()`, `N_()`, `set_language()`). |
+| `app/ui/controller.py` | `AcquisitionController` (session, data, reconnection). |
+| `app/ui/main_window.py` | Window shell: navigation rail, connection bar, pages, status bar, shortcuts. |
+| `app/ui/pages/*.py` | Live, Analysis, Device, Settings and About pages. |
+| `app/ui/widgets/plot_widget.py` | Stacked V/I/P plots: live (follow) and overview (selection region) modes. |
+| `app/ui/file_actions.py` | Import/export dialogs running in a background thread with progress. |
+| `app/core/gpu_*.py` | Pre-start OpenGL probe and fallback (default / NVIDIA offload / software). |
 
 ---
 
-### `app/core/harmonic_analysis.py`
+## User interface
 
-Provides FFT spectrum analysis optimized for DC systems with dynamic loads.
+- **Live** – stacked voltage/current/power plots with selectable series,
+  time-window presets, follow-live toggle (drag to look back, double-click to
+  return), crosshair readout in the status bar, live tiles (value, min/max,
+  moving or whole-recording average power) and energy, charge, sample rate and
+  lost samples.
+- **Analysis** – overview of the whole recording with a draggable selection;
+  statistics per quantity, energy/charge/RMS, power-supply quality with
+  recommendations, frequency spectrum (linear/log), **Markers** (segments
+  between markers with duration, average/peak power, energy, charge; click a
+  row to select it) and **Benchmark** (energy per inference, inferences per
+  joule, throughput per watt, gross and net of the idle power). Export the
+  selection or the whole recording as CSV or PDF; import CSV.
+- **Device** – connection and firmware info, INA226 averaging and conversion
+  times (presets and custom, with the resulting sample rate), OLED on/off,
+  save as device default, clock sync with the PC and device–PC offset,
+  host-side calibration (shunt, offset with "zero now", gains), device log and
+  a raw command line.
+- **Settings** – language, theme (dark/light/system), refresh rate, time
+  window, line width, antialiasing, grid, crosshair, units (auto prefix, base,
+  milli), significant digits, average-power mode, CPU indicator, OpenGL,
+  baud rate, auto-reconnect, no-data timeout, host averaging, CSV format and
+  PDF contents. Every change applies immediately and is saved.
 
-#### Classes
+Keyboard: `Ctrl+R` start/stop, `M` add a marker, `Ctrl+O` import,
+`Ctrl+E` export CSV, `Ctrl+P` export PDF, `Ctrl+1…5` switch page.
 
-**`FrequencyComponent`** (dataclass)
-```python
-@dataclass
-class FrequencyComponent:
-    frequency: float  # Hz
-    magnitude: float  # Amplitude
-    phase: float      # Radians
-    percentage: float # % of DC component
+### Markers
+
+Markers are added with the `M` key or the *Marker* button while recording
+(placed at the best estimate of "now": newest sample time plus the time
+elapsed since it arrived), or with a right-click on any plot at the exact
+point. Double-click a marker to rename it; drag it on the Analysis plot to
+move it; right-click it to delete it. Markers are stored in CSV files as
+trailing lines:
+
+```
+#MARKER<TAB>id<TAB>time_s<TAB>label        (add or replace)
+#MARKER<TAB>id<TAB>DELETE                  (remove)
 ```
 
-**`HarmonicAnalysis`** (dataclass)
-```python
-@dataclass
-class HarmonicAnalysis:
-    dominant_frequency: float
-    modulation_depth: float  # For DC systems (replaces THD)
-    frequency_components: List[FrequencyComponent]
-    sample_rate: float
-    duration: float
-```
+Later lines for the same id win, so a recording file is only ever appended
+to. Tools such as pandas can skip them with `comment="#"`.
 
-**`HarmonicAnalyzer`**
-- `analyze_signal()`: Performs FFT on current signal
-- `analyze_spectrum()`: General spectrum analysis for DC systems
-- Removes AC-specific constraints (40-70 Hz range)
-- Finds dominant frequencies in load variations
-- Calculates modulation depth for DC systems
+### Continuous recording
 
-#### Usage Example
-
-```python
-from app.core import HarmonicAnalyzer
-
-analyzer = HarmonicAnalyzer()
-result = analyzer.analyze_signal(measurements)
-
-if result:
-    print(f"Dominant frequency: {result.dominant_frequency:.3f} Hz")
-    print(f"Modulation depth: {result.modulation_depth:.2f}%")
-```
+With *Save recordings automatically* (default on) every live acquisition is
+written, while it runs, to `Documents/EdgePowerMeter/recording_YYYYMMDD_HHMMSS.csv`
+(folder configurable). It is the same CSV format as Export CSV, flushed about
+once per second, so the file is valid even after a crash. No hidden or
+temporary files are created; recordings shorter than one second (accidental
+Start/Stop) are deleted; existing files are never overwritten. Exporting the
+whole recording as CSV offers the existing file instead of creating a
+duplicate. The status bar shows the file and its size; click it to open the
+folder.
 
 ---
 
-### `app/core/power_supply_quality.py`
+## Translations
 
-Analyzes power supply quality metrics for DC systems.
+All UI text is written in English and wrapped in `tr()`. Catalogs for Italian,
+Spanish, French and German are generated **offline on the developer machine**
+by a local machine-translation model (Argos Translate models run through
+CTranslate2; no cloud service), then corrected through
+`app/i18n/overrides/<lang>.json`, which always wins. The tool refuses
+translations that lose placeholders or brackets. See
+[tools/i18n/README.md](../tools/i18n/README.md):
 
-#### Classes
-
-**`PowerSupplyQuality`** (dataclass)
-```python
-@dataclass
-class PowerSupplyQuality:
-    voltage_ripple_percent: float
-    voltage_ripple_mv: float
-    load_regulation_percent: float
-    settling_time_ms: float
-    rms_noise_mv: float
-    stability_rating: str  # "Excellent", "Good", "Fair", "Poor"
+```bash
+tools/i18n/.venv/bin/python tools/i18n/translate.py extract
+tools/i18n/.venv/bin/python tools/i18n/translate.py translate --prune
+tools/i18n/.venv/bin/python tools/i18n/translate.py check
 ```
 
-**`PowerSupplyAnalyzer`**
-- `analyze_voltage_quality()`: Calculates ripple, RMS noise
-- `_analyze_load_regulation()`: Measures voltage stability under load
-- `get_quality_recommendations()`: Provides actionable feedback
-
-Quality thresholds:
-- **Excellent**: <0.05% ripple
-- **Good**: <0.1% ripple
-- **Fair**: <1% ripple
-- **Poor**: >1% ripple
-
-#### Usage Example
-
-```python
-from app.core import PowerSupplyAnalyzer
-
-analyzer = PowerSupplyAnalyzer()
-quality = analyzer.analyze_voltage_quality(measurements)
-
-print(f"Ripple: {quality.voltage_ripple_percent:.3f}%")
-print(f"Stability: {quality.stability_rating}")
-```
-
----
-
-### `app/serial/sampler.py`
-
-Provides sampling rate control with time-based subsampling.
-
-#### Classes
-
-**`SampleRateController`**
-- `should_accept_sample()`: Time-based subsampling logic
-- `get_actual_rate()`: Returns achieved sample rate
-- `update_target()`: Runtime target rate adjustment
-- `reset()`: Resets timing state
-
-When `target_sample_rate` is:
-- **0**: Maximum device rate (no subsampling)
-- **< device max**: Subsamples to target rate
-- **> device max**: Uses device maximum
-
-#### Usage Example
-
-```python
-from app.serial import SampleRateController
-
-controller = SampleRateController(target_rate=10, max_rate=100)
-
-if controller.should_accept_sample():
-    process_sample(data)
-
-print(f"Actual rate: {controller.get_actual_rate():.1f} Hz")
-```
-
----
-
-### `app/ui/main_window.py`
-
-The main application window containing:
-- Three real-time graphs (Voltage, Current, Power)
-- Statistics cards
-- Control panel (Connect, Start, Export)
-- Settings access
-
-#### Key Classes
-
-**`PlotWidget`** (`app/ui/widgets/plot_widget.py`)
-- Custom pyqtgraph widget with three synchronized panels
-- OpenGL acceleration for smooth 60+ FPS rendering (if PyOpenGL installed)
-- Antialiasing for smooth line rendering
-- Event-driven updates triggered by user pan/zoom interactions
-- Y-axis auto-scales to visible data
-- Middle-click to reset X-axis to live auto-scroll
-- Relative time axis (starts from 0 seconds)
-- Region selector for data export
-
-**`PlotBuffers`** (`app/ui/widgets/plot_buffers.py`)
-- Manages data for real-time plotting
-- Relative time tracking from acquisition start
-- Efficient numpy array caching
-- Binary search for visible data slicing
-
-**`MainWindow`**
-- Main application window
-- Manages all UI components
-- Handles serial connection state
-
----
-
-### `app/ui/theme.py`
-
-Defines the application's visual themes.
-
-#### Theme Colors
-
-**Dark Theme**
-```python
-DARK_THEME = ThemeColors(
-    bg_primary="#0d1117",
-    bg_secondary="#161b22",
-    text_primary="#f0f6fc",
-    accent="#58a6ff",
-    chart_voltage="#58a6ff",
-    chart_current="#d29922",
-    chart_power="#3fb950",
-    ...
-)
-```
-
-**Light Theme**
-```python
-LIGHT_THEME = ThemeColors(
-    bg_primary="#ffffff",
-    bg_secondary="#f6f8fa",
-    text_primary="#1f2328",
-    accent="#0969da",
-    ...
-)
-```
-
-#### Stylesheet Generation
-
-```python
-def generate_stylesheet(theme: ThemeColors) -> str:
-    """Generate complete Qt stylesheet from theme colors."""
-```
-
----
-
-### `app/ui/components.py`
-
-Reusable UI components used across the application.
-
-#### Components
-
-- **`StatCard`**: Displays a single statistic with label and value
-- **`IconButton`**: Button with icon support
-- Custom styled widgets
-
----
-
-### `app/ui/settings.py`
-
-Application settings management.
-
-#### `AppSettings` (dataclass)
-
-```python
-@dataclass
-class AppSettings:
-    # Appearance
-    theme: str = "dark"
-    
-    # Units
-    voltage_unit: str = "V"
-    current_unit: str = "mA"
-    power_unit: str = "mW"
-    
-    # Display
-    graph_points: int = 1000
-    update_interval: int = 50
-    
-    # Serial
-    default_baud: int = 115200
-    auto_reconnect: bool = True
-    
-    # Export
-    csv_separator: str = ","
-    pdf_include_graphs: bool = True
-```
-
-#### `SettingsDialog`
-
-Tabbed dialog for configuring:
-- **Appearance**: Theme selection
-- **Units**: Measurement units
-- **Display**: Graph settings
-- **Serial**: Connection settings
-- **Export**: Export preferences
-
----
-
-### `app/ui/report.py`
-
-Export and import functionality for measurements.
-
-#### `Statistics` (dataclass)
-
-```python
-@dataclass
-class Statistics:
-    voltage_min: float
-    voltage_max: float
-    voltage_avg: float
-    voltage_std: float
-    current_min: float
-    current_max: float
-    current_avg: float
-    current_std: float
-    power_min: float
-    power_max: float
-    power_avg: float
-    power_std: float
-    energy_wh: float
-    charge_ah: float
-    duration_seconds: float
-    count: int
-```
-
-#### `CSVImporter`
-
-**Import from CSV**
-- Auto-detection of separator (comma, semicolon, tab, space)
-- Multiple timestamp format support
-- Load previously exported data for re-analysis
-
-```python
-records = CSVImporter.import_csv(Path("measurement.csv"))
-```
-
-#### `ReportGenerator`
-
-**CSV Export**
-- Full measurement history
-- Timestamp, Voltage, Current, Power columns
-- Configurable separator
-
-**PDF Export**
-- Professional report with statistics tables
-- **Voltage, Current, and Power graphs** (matplotlib)
-- Derived metrics (sampling rate, ripple, impedance)
-- Automatic pagination
-
----
-
-## Serial Communication
-
-### Protocol
-
-The firmware sends CSV data over USB serial at **921600 baud**:
-
-```
-Timestamp,Voltage[V],Current[A],Power[W]
-2025-11-30 12:34:56.123,5.0123,0.2500,1.2531
-```
-
-### Parsing
-
-The `MeasurementParser` class handles:
-1. Line splitting by comma
-2. Timestamp parsing (multiple formats supported)
-3. Value conversion (A→mA, W→mW)
-4. Invalid data handling
-
-### Connection Methods
-
-Two methods are attempted:
-1. **Direct file descriptor** (Linux) - lowest latency
-2. **PySerial** - cross-platform fallback
-
----
-
-## Data Processing
-
-### Millisecond-Precision Timestamps
-
-The firmware uses the DS3231 SQW (1Hz square wave) output synchronized with `millis()` to provide millisecond-accurate timestamps:
-
-```
-12:34:56.000 → V=5.001, I=250.1, P=1250.3
-12:34:56.100 → V=4.999, I=249.9, P=1249.7
-12:34:56.200 → V=5.002, I=250.2, P=1250.5
-```
-
-The `PlotBuffers` class stores each sample directly and rejects any out-of-order timestamps to prevent graph artifacts.
-
-### Statistics Calculation
-
-Statistics are computed in real-time:
-- Min/Max tracking
-- Running average
-- Energy integration (Wh = P × dt)
-
----
-
-## Export Formats
-
-### CSV Format
-
-```csv
-Timestamp,Voltage (V),Current (mA),Power (mW)
-2025-11-30 12:34:56.123456,5.0123,250.1234,1253.0876
-```
-
-### PDF Format
-
-Professional report including:
-- Header with generation timestamp
-- Measurement duration and sample count
-- Voltage/Current/Power statistics
-- Derived metrics
-- Footer with page numbers
-
----
-
-## Themes
-
-### Switching Themes
-
-```python
-# In code
-window.toggle_theme()
-
-# Or via settings dialog
-```
-
-### Custom Themes
-
-Create a new `ThemeColors` instance:
-
-```python
-MY_THEME = ThemeColors(
-    bg_primary="#1a1a2e",
-    bg_secondary="#16213e",
-    text_primary="#eaeaea",
-    accent="#e94560",
-    ...
-)
-```
+The language defaults to the operating-system language and can be changed in
+Settings; the window is rebuilt in place without losing data.
 
 ---
 
 ## Settings
 
-Settings are stored in memory and can be accessed:
+`AppSettings` is persisted with `QSettings` (group `settings_v2`):
 
-```python
-from app.ui.settings import AppSettings, SettingsDialog
+- Linux: `~/.config/EdgePowerMeter/EdgePowerMeter.conf`
+- Windows: registry `HKCU\Software\EdgePowerMeter`
+- macOS: `~/Library/Preferences/com.EdgePowerMeter.plist`
 
-# Load defaults
-settings = AppSettings()
-
-# Show dialog
-dialog = SettingsDialog(settings, parent=window)
-if dialog.exec() == QDialog.Accepted:
-    settings = dialog.get_settings()
-```
-
-### Persistence
-
-Settings can be saved to JSON:
-
-```python
-import json
-from dataclasses import asdict
-
-# Save
-with open("settings.json", "w") as f:
-    json.dump(asdict(settings), f)
-
-# Load
-with open("settings.json") as f:
-    settings = AppSettings(**json.load(f))
-```
+Values are type-checked and clamped on load, so a corrupted entry falls back
+to its default. The few options that existed in 1.x are migrated.
 
 ---
 
-## Dependencies
+## Export formats
 
-| Package | Version | Purpose |
-|---------|---------|----------|
-| PySide6 | ≥6.0 | Qt GUI framework |
-| pyqtgraph | ≥0.13 | Real-time plotting |
-| pyserial | ≥3.5 | Serial communication |
-| reportlab | ≥4.0 | PDF generation |
-| matplotlib | ≥3.5 | Graphs in PDF reports |
-| numpy | ≥1.20 | Numerical operations |
+### CSV
 
-Install all:
-```bash
-pip install PySide6 pyqtgraph pyserial reportlab matplotlib numpy
 ```
+Timestamp,RelativeTime[s],Voltage[V],Current[A],Power[W]
+2026-10-08 12:34:56.123,0.000000,5.012500,0.250000,1.253125
+```
+
+- `RelativeTime` is the precise (device) time axis; `Timestamp` is local
+  wall-clock time with millisecond resolution, or Unix seconds if chosen.
+- With *decimal comma* the separator becomes `;` for spreadsheet locales such
+  as Italian or German.
+- Import auto-detects separator, decimal comma, timestamp style and the
+  4-column layout of older files and firmware logs.
+
+### PDF
+
+Key-figure tiles, recording metadata, per-quantity table (min, max, average,
+std dev, RMS, peak-to-peak), energy and derived quantities (charge, power
+variability, current crest factor, voltage ripple, load resistance), markers
+and segment table, benchmark results, vector charts of V/I/P with min/max
+envelopes and markers, power distribution histogram with percentiles,
+power-supply quality with pass/fail table and recommendations, frequency
+spectrum (linear and dB) with peaks, and the instrument settings
+(sensor configuration and calibration) for traceability.
+
+---
+
+## Testing
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest -q
+```
+
+Tests run headless (`QT_QPA_PLATFORM=offscreen`), use temporary QSettings and
+a scripted fake device (`tests/fakes.py`) that emulates firmware 1.x and 2.x,
+including unplugging, silence, slow boot and dropped lines.
 
 ---
 
 ## Troubleshooting
 
-### Serial Connection Issues
+**Permission denied on the serial port (Linux)** – add the user to the
+`dialout` group and log in again: `sudo usermod -a -G dialout $USER`.
 
-**Permission denied on Linux:**
-```bash
-sudo usermod -a -G dialout $USER
-# Log out and back in
-```
+**"Firmware 1.x detected"** – the app works, but device time, lost-sample
+detection, sensor configuration and clock sync need firmware 2.0
+(`firmware/` folder, see HARDWARE.md).
 
-**Port not found:**
-```bash
-# List available ports
-ls /dev/ttyUSB* /dev/ttyACM*
-```
+**Lost samples increase** – the PC is not reading fast enough (very slow
+machine or heavy load) or the INA226 period is below ~0.5 ms. Increase the
+averaging on the Device page.
 
-### Graph Performance
-
-If graphs are slow:
-1. Reduce `graph_points` in settings
-2. Increase `update_interval`
-3. Close other applications
-
-### PDF Export Issues
-
-If PDF is cut off:
-- Update to latest reportlab version
-- Check available disk space
-
----
-
-## API Reference
-
-For complete API documentation, see the source code docstrings or generate with:
-
-```bash
-pip install pdoc
-pdoc --html app/
-```
+**Blank or slow plots** – disable *Hardware acceleration (OpenGL)* in
+Settings, or use *Re-detect graphics on next launch* on the About page.

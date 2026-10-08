@@ -1,39 +1,42 @@
-"""Three-panel power monitoring plot widget with time window control."""
+"""Stacked voltage / current / power plots with a sliding time window.
+
+Two modes:
+  * live (default): follows the newest data with a configurable window;
+    wheel changes the window length, dragging pans and pauses following,
+    double-click resumes following.
+  * overview: shows the whole recording and a draggable selection region
+    (mirrored on every visible plot) used by the Analysis page.
+
+Only the visible slice is handed to pyqtgraph, which then peak-downsamples it
+to the pixel width, so redraw cost does not grow with recording length.
+"""
 
 from __future__ import annotations
-from typing import Optional, Tuple
+
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QLabel
-from PySide6.QtGui import QFont
 
+from ...core.samples import Samples
+from ...i18n import N_, tr
 from ..theme import ThemeColors
-from .plot_buffers import PlotBuffers
 
-# Whether OpenGL-accelerated rendering has been probed and found usable.
+# Whether OpenGL rendering has been probed and found usable.
 # None = not yet checked, True/False = checked and cached.
 _opengl_checked: Optional[bool] = None
 
 
 def _opengl_actually_works() -> bool:
     """Verify a real GL context can be created, not just that the PyOpenGL
-    Python bindings import cleanly.
-
-    A sandboxed install (snap/flatpak) can bundle PyOpenGL while the host's
-    GL driver - hardware *and* the swrast software fallback - fails to load
-    inside the confined environment. Trusting `import OpenGL` alone then
-    makes pyqtgraph switch its viewport to QOpenGLWidget, which cannot get a
-    context there; Qt's whole backing-store compositor then fails too,
-    breaking the entire window instead of just falling back to the raster
-    (non-GL) painter that works everywhere.
-    """
+    bindings import. Sandboxed installs (snap/flatpak) can ship PyOpenGL while
+    the host GL driver fails to load; trusting the import would switch
+    pyqtgraph to QOpenGLWidget and break the whole window."""
     try:
         import OpenGL  # noqa: F401
     except ImportError:
         return False
-
     try:
         from PySide6.QtGui import QOffscreenSurface, QOpenGLContext
         surface = QOffscreenSurface()
@@ -48,464 +51,503 @@ def _opengl_actually_works() -> bool:
         return False
 
 
-def _opengl_available() -> bool:
-    """Cached OpenGL capability check (requires a QApplication to exist)."""
+def _opengl_available(enabled: bool = True) -> bool:
+    """Cached OpenGL capability check (needs a QApplication).
+
+    `enabled=False` (user setting) skips the probe and forces raster rendering.
+    """
     global _opengl_checked
+    if not enabled:
+        pg.setConfigOptions(useOpenGL=False, enableExperimental=False)
+        return False
     if _opengl_checked is None:
         _opengl_checked = _opengl_actually_works()
         pg.setConfigOptions(useOpenGL=_opengl_checked, enableExperimental=_opengl_checked)
     return _opengl_checked
 
 
-class PlotWidget(pg.GraphicsLayoutWidget):
-    """Three-panel plot widget with sliding time window.
-    
-    Features:
-        - Configurable time window (default 10 seconds)
-        - Mouse wheel to zoom time window
-        - Drag to pan through history
-        - Auto-scroll when at live edge
-        - Middle-click to reset to live view
-        - All three plots synchronized
-        - Crosshair with value display on hover
+def _decimate(x: np.ndarray, y: np.ndarray, width_px: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Min/max envelope with about two points per pixel.
+
+    pyqtgraph's own peak downsampling still walks every sample on every
+    redraw (≈0.7 s for one hour at 1 kHz); reducing here first keeps redraws
+    cheap and independent of the recording length, while spikes survive
+    because each bucket contributes both its minimum and its maximum.
     """
-    
-    # Signal emitted when view needs refresh (pan, zoom, resize)
+    n = len(x)
+    bucket = n // width_px
+    if bucket < 4:
+        return x, y
+    m = (n // bucket) * bucket
+    yb = y[:m].reshape(-1, bucket)
+    lo = yb.min(axis=1)
+    hi = yb.max(axis=1)
+    xb = x[:m:bucket]
+    xs = np.repeat(xb, 2)
+    ys = np.empty(2 * len(lo), dtype=y.dtype)
+    ys[0::2] = lo
+    ys[1::2] = hi
+    if m < n:                       # keep the newest samples exactly
+        xs = np.concatenate((xs, x[m:]))
+        ys = np.concatenate((ys, y[m:]))
+    return xs, ys
+
+
+SERIES: Tuple[Tuple[str, str, str], ...] = (
+    ("v", N_("Voltage"), "V"),
+    ("i", N_("Current"), "A"),
+    ("p", N_("Power"), "W"),
+)
+
+
+class PlotWidget(pg.GraphicsLayoutWidget):
     view_changed = Signal()
-
-    # Signal emitted when cursor hovers over data (t, v, i, p)
-    cursor_values = Signal(float, float, float, float)
-
-    # Signal emitted while the export region selector is dragged
+    cursor_values = Signal(float, float, float, float)   # t, v, i, p
+    cursor_left = Signal()
     region_changed = Signal()
-    
-    # Time window settings
-    DEFAULT_WINDOW_SECONDS = 10.0
-    MIN_WINDOW_SECONDS = 1.0
-    MAX_WINDOW_SECONDS = 300.0  # 5 minutes max
-    ZOOM_FACTOR = 1.2
-    
-    def __init__(self, theme: ThemeColors, parent=None):
-        # Decide GL vs raster rendering before building any plot items -
-        # pyqtgraph applies useOpenGL per-viewport at creation time.
-        _opengl_available()
+    follow_changed = Signal(bool)
+    # Markers: (marker id, new time) after a drag; id on double-click;
+    # (time under cursor, nearest marker id or 0, global QPoint) on right-click.
+    marker_moved = Signal(int, float)
+    marker_activated = Signal(int)
+    context_requested = Signal(float, int, object)
+    window_changed = Signal(float)
 
+    MIN_WINDOW_S = 0.2
+    MAX_WINDOW_S = 3600.0
+    ZOOM_FACTOR = 1.25
+
+    def __init__(self, theme: ThemeColors, settings, overview: bool = False, parent=None):
+        _opengl_available(getattr(settings, "use_opengl", True))
         super().__init__(parent)
         self.theme = theme
-        self.setBackground(theme.bg_secondary)
-        
-        # Time window state
-        self._window_seconds = self.DEFAULT_WINDOW_SECONDS
-        self._auto_scroll = True
-        self._last_data_time = 0.0
+        self.settings = settings
+        self.overview = overview
+        self._data = Samples.empty()
+        self._window_s = float(settings.time_window_s)
+        self._follow = not overview
         self._updating = False
-        
-        # Grid settings
-        self._show_grid = True
-        self._grid_alpha = 0.2
-        
-        # Crosshair settings
-        self._show_crosshair = True
-        self._crosshair_lines = []
-        self._current_data = (np.array([]), np.array([]), np.array([]), np.array([]))
-        
-        self._setup_plots()
-        self._setup_crosshair()
-        self.region: Optional[pg.LinearRegionItem] = None
-        
-        # Enable mouse tracking for crosshair
-        self.setMouseTracking(True)
-    
-    def _setup_plots(self) -> None:
-        """Create the three plot panels."""
-        # Enable antialiasing for smooth lines
-        pg.setConfigOptions(antialias=True)
-        
-        # Voltage plot
-        self.plot_v = self.addPlot(
-            row=0, col=0, title="Voltage [V]"
-        )
-        self.plot_v.setLabel('bottom', 'Time [s]')
-        self._style_plot(self.plot_v, self.theme.chart_voltage)
-        self.curve_v = self.plot_v.plot(
-            pen=pg.mkPen(self.theme.chart_voltage, width=2)
-        )
-        self.curve_v.setClipToView(True)  # Only render visible points
-        
-        self.nextRow()
-        
-        # Current plot
-        self.plot_i = self.addPlot(
-            row=1, col=0, title="Current [A]"
-        )
-        self.plot_i.setLabel('bottom', 'Time [s]')
-        self._style_plot(self.plot_i, self.theme.chart_current)
-        self.curve_i = self.plot_i.plot(
-            pen=pg.mkPen(self.theme.chart_current, width=2)
-        )
-        self.curve_i.setClipToView(True)
-        
-        self.nextRow()
-        
-        # Power plot
-        self.plot_p = self.addPlot(
-            row=2, col=0, title="Power [W]"
-        )
-        self.plot_p.setLabel('bottom', 'Time [s]')
-        self._style_plot(self.plot_p, self.theme.chart_power)
-        self.curve_p = self.plot_p.plot(
-            pen=pg.mkPen(self.theme.chart_power, width=2)
-        )
-        self.curve_p.setClipToView(True)
-        
-        # Link X-axes so all plots pan together
-        self.plot_i.setXLink(self.plot_v)
-        self.plot_p.setXLink(self.plot_v)
-        
-        # Configure X-axis: we control range manually
-        for plot in [self.plot_v, self.plot_i, self.plot_p]:
-            plot.enableAutoRange(axis='x', enable=False)
+        self._visible = {"v": settings.show_voltage, "i": settings.show_current,
+                         "p": settings.show_power}
+        self._plots: Dict[str, pg.PlotItem] = {}
+        self._curves: Dict[str, pg.PlotDataItem] = {}
+        self._vlines: List[pg.InfiniteLine] = []
+        self._regions: List[pg.LinearRegionItem] = []
+        self._region_values: Optional[Tuple[float, float]] = None
+        self._markers: list = []                      # Marker objects
+        self._dense = False
+        self._marker_lines: List[pg.InfiniteLine] = []
+        self._syncing_region = False
+
+        self.setBackground(theme.plot_bg)
+        self.ci.setSpacing(4)
+        self.ci.setContentsMargins(4, 4, 8, 4)
+        self.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        self._build()
+
+    # ------------------------------------------------------------- building
+
+    def _build(self) -> None:
+        self.ci.clear()
+        self._plots.clear()
+        self._curves.clear()
+        self._vlines.clear()
+        self._marker_lines = []
+        self._regions.clear()
+
+        keys = [k for k, _, _ in SERIES if self._visible[k]] or ["p"]
+        first: Optional[pg.PlotItem] = None
+        for row, key in enumerate(keys):
+            name, unit = next((n, u) for k, n, u in SERIES if k == key)
+            plot = self.addPlot(row=row, col=0)
+            plot.setLabel("left", tr(name), units=unit)
+            plot.getAxis("left").setWidth(64)
+            plot.getAxis("left").enableAutoSIPrefix(self.settings.unit_mode == "auto")
+            if row == len(keys) - 1:
+                plot.setLabel("bottom", tr("Time"), units="s")
+            else:
+                plot.getAxis("bottom").setStyle(showValues=False)
             plot.setMouseEnabled(x=True, y=False)
-            plot.enableAutoRange(axis='y', enable=True)
-        
-        # Connect to ViewBox signal for pan/zoom detection
-        self.plot_v.getViewBox().sigRangeChanged.connect(self._on_view_changed)
-    
-    def _setup_crosshair(self) -> None:
-        """Setup crosshair lines for value display on hover."""
-        # Vertical line that spans all plots (synced via X-link)
-        pen = pg.mkPen(color=self.theme.text_muted, width=1, style=Qt.DashLine)
-        
-        for plot in [self.plot_v, self.plot_i, self.plot_p]:
-            vline = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+            plot.enableAutoRange(axis="x", enable=False)
+            plot.enableAutoRange(axis="y", enable=True)
+            plot.hideButtons()
+            plot.setMenuEnabled(False)
+            if first is None:
+                first = plot
+                plot.getViewBox().sigXRangeChanged.connect(self._on_x_range_changed)
+            else:
+                plot.setXLink(first)
+            curve = plot.plot(antialias=self.settings.antialias)
+            curve.setDownsampling(auto=True, method="peak")
+            curve.setClipToView(True)
+            vline = pg.InfiniteLine(angle=90, movable=False)
             vline.setVisible(False)
             plot.addItem(vline, ignoreBounds=True)
-            self._crosshair_lines.append(vline)
-        
-        # Connect mouse move signal from each plot
-        for plot in [self.plot_v, self.plot_i, self.plot_p]:
-            plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
-    
-    def _on_mouse_moved(self, pos) -> None:
-        """Handle mouse move for crosshair."""
-        if not self._show_crosshair:
-            return
-        
-        # Check if position is within any plot
-        for plot in [self.plot_v, self.plot_i, self.plot_p]:
-            if plot.sceneBoundingRect().contains(pos):
-                mouse_point = plot.getViewBox().mapSceneToView(pos)
-                x = mouse_point.x()
-                
-                # Show crosshair lines
-                for vline in self._crosshair_lines:
-                    vline.setPos(x)
-                    vline.setVisible(True)
-                
-                # Find nearest data point and emit values
-                self._emit_cursor_values(x)
-                return
-        
-        # Mouse outside plots - hide crosshair
-        for vline in self._crosshair_lines:
-            vline.setVisible(False)
-    
-    def _emit_cursor_values(self, x: float) -> None:
-        """Find and emit values at cursor position."""
-        xs, vs, cs, ps = self._current_data
-        if len(xs) == 0:
-            return
-        
-        # Find nearest index using binary search
-        idx = np.searchsorted(xs, x)
-        if idx >= len(xs):
-            idx = len(xs) - 1
-        elif idx > 0:
-            # Check which neighbor is closer
-            if abs(xs[idx-1] - x) < abs(xs[idx] - x):
-                idx = idx - 1
-        
-        self.cursor_values.emit(xs[idx], vs[idx], cs[idx], ps[idx])
-    
-    def _style_plot(self, plot: pg.PlotItem, color: str) -> None:
-        """Apply theme styling to a plot panel."""
-        plot.showGrid(x=self._show_grid, y=self._show_grid, alpha=self._grid_alpha)
-        plot.getAxis('left').setTextPen(self.theme.text_primary)
-        plot.getAxis('left').setPen(self.theme.border_default)
-        plot.getAxis('bottom').setTextPen(self.theme.text_primary)
-        plot.getAxis('bottom').setPen(self.theme.border_default)
-        plot.setTitle(plot.titleLabel.text, color=color, size='11pt')
-        plot.getViewBox().setBackgroundColor(self.theme.bg_secondary)
-    
-    def _on_view_changed(self, vb, range_) -> None:
-        """Called when ViewBox range changes (user pan/zoom)."""
-        if self._updating:
-            return
-            
-        # Check if near live edge
-        x_range = range_[0]
-        if self._last_data_time > 0:
-            at_live_edge = x_range[1] >= self._last_data_time - 0.5
-            if not at_live_edge:
-                self._auto_scroll = False
-        
-        self.view_changed.emit()
-    
-    def update_data(self, buffers: PlotBuffers) -> None:
-        """Update plots with visible portion of data."""
-        if buffers.is_empty:
-            return
-        
-        xs, vs, cs, ps = buffers.get_arrays()
-        if len(xs) == 0:
-            return
-        
-        self._updating = True
-        
-        # Store data for crosshair lookup
-        self._current_data = (xs, vs, cs, ps)
-        
-        self._last_data_time = xs[-1]
-        
-        # If auto-scroll, update view range to follow live data
-        if self._auto_scroll:
-            t_end = self._last_data_time
-            t_start = t_end - self._window_seconds
-            self.plot_v.setXRange(t_start, t_end, padding=0)
-        
-        # Get visible range and render only that portion
-        view_range = self.plot_v.viewRange()[0]
-        t_start = view_range[0] - 0.5
-        t_end = view_range[1] + 0.5
-        
-        # Find visible slice
-        idx_start = max(0, np.searchsorted(xs, t_start) - 1)
-        idx_end = min(len(xs), np.searchsorted(xs, t_end) + 1)
-        
-        # Update curves with only visible data
-        self.curve_v.setData(xs[idx_start:idx_end], vs[idx_start:idx_end])
-        self.curve_i.setData(xs[idx_start:idx_end], cs[idx_start:idx_end])
-        self.curve_p.setData(xs[idx_start:idx_end], ps[idx_start:idx_end])
-        
-        self._updating = False
-    
-    def _update_view_range(self) -> None:
-        """Update the visible time range to follow live data."""
-        if self._last_data_time <= 0:
-            return
-        
-        # Follow live data: show last N seconds
-        t_end = self._last_data_time
-        t_start = t_end - self._window_seconds
-        
-        # Prevent signal recursion
-        self._is_panning = True
-        self.plot_v.setXRange(t_start, t_end, padding=0)
-        self._is_panning = False
-    
-    def wheelEvent(self, event) -> None:
-        """Handle mouse wheel for time window zoom."""
-        delta = event.angleDelta().y()
-        
-        if delta > 0:
-            # Zoom in (smaller window)
-            self._window_seconds = max(
-                self.MIN_WINDOW_SECONDS,
-                self._window_seconds / self.ZOOM_FACTOR
-            )
-        else:
-            # Zoom out (larger window)
-            self._window_seconds = min(
-                self.MAX_WINDOW_SECONDS,
-                self._window_seconds * self.ZOOM_FACTOR
-            )
-        
-        # Apply new window
-        if self._auto_scroll:
-            self._update_view_range()
-        else:
-            # Zoom around the point under the cursor (falls back to the view
-            # center if the cursor isn't over a plot), matching the zoom
-            # behavior users expect from other charting/mapping tools instead
-            # of always re-centering on the current view's midpoint.
-            current_range = self.plot_v.viewRange()[0]
-            old_span = current_range[1] - current_range[0]
-            anchor = (current_range[0] + current_range[1]) / 2
-            frac = 0.5
+            self._plots[key] = plot
+            self._curves[key] = curve
+            self._vlines.append(vline)
+            if self.overview:
+                region = pg.LinearRegionItem(movable=True)
+                region.setZValue(10)
+                region.setVisible(False)
+                region.sigRegionChanged.connect(self._on_region_moved)
+                plot.addItem(region, ignoreBounds=True)
+                self._regions.append(region)
 
-            scene_pos = self.mapToScene(event.position().toPoint())
-            for plot in (self.plot_v, self.plot_i, self.plot_p):
-                if plot.sceneBoundingRect().contains(scene_pos):
-                    anchor = plot.getViewBox().mapSceneToView(scene_pos).x()
-                    if old_span > 0:
-                        frac = (anchor - current_range[0]) / old_span
-                    break
+        self.apply_style()
+        self._draw_markers()
+        if self._region_values is not None:
+            self.set_region(*self._region_values)
+        self.refresh()
 
-            t_start = anchor - frac * self._window_seconds
-            t_end = t_start + self._window_seconds
+    def apply_style(self) -> None:
+        t = self.theme
+        self.setBackground(t.plot_bg)
+        colors = {"v": t.chart_voltage, "i": t.chart_current, "p": t.chart_power}
+        for key, plot in self._plots.items():
+            for ax_name in ("left", "bottom"):
+                ax = plot.getAxis(ax_name)
+                ax.setPen(pg.mkPen(t.border))
+                ax.setTextPen(pg.mkPen(t.text_secondary))
+                ax.label.setDefaultTextColor(pg.mkColor(colors[key] if ax_name == "left" else t.text_secondary))
+            plot.showGrid(x=self.settings.show_grid, y=self.settings.show_grid,
+                          alpha=self.settings.grid_alpha)
+            plot.getAxis("left").enableAutoSIPrefix(self.settings.unit_mode == "auto")
+        self._apply_pens()
+        cross = pg.mkPen(t.text_muted, width=1, style=Qt.DashLine)
+        for v in self._vlines:
+            v.setPen(cross)
+        for r in self._regions:
+            accent = pg.mkColor(t.accent)
+            fill = pg.mkColor(t.accent)
+            fill.setAlpha(40)
+            r.setBrush(pg.mkBrush(fill))
+            for line in r.lines:
+                line.setPen(pg.mkPen(accent, width=2))
+                line.setHoverPen(pg.mkPen(accent, width=3))
 
-            self._is_panning = True
-            self.plot_v.setXRange(t_start, t_end, padding=0)
-            self._is_panning = False
+    def _apply_pens(self) -> None:
+        t = self.theme
+        colors = {"v": t.chart_voltage, "i": t.chart_current, "p": t.chart_power}
+        width = 1.0 if self._dense else self.settings.line_width
+        # Antialiasing adds nothing visible on a dense min/max envelope but
+        # costs several times the paint time.
+        antialias = self.settings.antialias and not self._dense
+        for key, curve in self._curves.items():
+            curve.setPen(pg.mkPen(colors[key], width=width))
+            curve.opts["antialias"] = antialias
 
-        event.accept()
-    
-    def mousePressEvent(self, event) -> None:
-        """Handle mouse press events."""
-        if event.button() == Qt.MiddleButton:
-            # Reset to live view
-            self._auto_scroll = True
-            self._window_seconds = self.DEFAULT_WINDOW_SECONDS
-            self._update_view_range()
-            self.view_changed.emit()
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-    
-    def mouseReleaseEvent(self, event) -> None:
-        """Handle mouse release - ensure final update after drag."""
-        super().mouseReleaseEvent(event)
-        # Force update when user finishes dragging
-        self.view_changed.emit()
-    
-    def resizeEvent(self, event) -> None:
-        """Handle resize events - trigger re-render."""
-        super().resizeEvent(event)
-        self.view_changed.emit()
-    
-    # -------------------------------------------------------------------------
-    # Region selector for data export
-    # -------------------------------------------------------------------------
-    
-    def add_region_selector(self, t_min: float, t_max: float) -> None:
-        """Add or update a region selector on the power plot."""
-        self.remove_region_selector()
-        self.region = pg.LinearRegionItem(
-            values=(t_min, t_max),
-            brush=pg.mkBrush(self.theme.accent_primary + "30"),
-            pen=pg.mkPen(self.theme.accent_primary, width=2),
-        )
-        self.region.setZValue(10)
-        # Live feedback while dragging: selection stats (samples/duration/avg
-        # power) in the sidebar should track the handles, not just refresh on
-        # unrelated pan/zoom/resize events.
-        self.region.sigRegionChanged.connect(lambda: self.region_changed.emit())
-        self.plot_p.addItem(self.region)
-    
-    def remove_region_selector(self) -> None:
-        """Remove the region selector if present."""
-        if self.region:
-            try:
-                self.plot_p.removeItem(self.region)
-            except Exception:
-                pass
-            self.region = None
-    
-    def get_selected_range(self) -> Optional[Tuple[float, float]]:
-        """Get the currently selected time range."""
-        if not self.region:
-            return None
-        return tuple(sorted(self.region.getRegion()))
-    
-    # -------------------------------------------------------------------------
-    # Theme and cleanup
-    # -------------------------------------------------------------------------
-    
-    def update_theme(self, theme: ThemeColors) -> None:
-        """Update all theme-dependent colors."""
+    def set_theme(self, theme: ThemeColors) -> None:
         self.theme = theme
-        self.setBackground(theme.bg_secondary)
-        
-        for plot, color in [
-            (self.plot_v, theme.chart_voltage),
-            (self.plot_i, theme.chart_current),
-            (self.plot_p, theme.chart_power)
-        ]:
-            plot.getAxis('left').setTextPen(theme.text_primary)
-            plot.getAxis('left').setPen(theme.border_default)
-            plot.getAxis('bottom').setTextPen(theme.text_primary)
-            plot.getAxis('bottom').setPen(theme.border_default)
-            plot.setTitle(plot.titleLabel.text, color=color, size='11pt')
-            plot.getViewBox().setBackgroundColor(theme.bg_secondary)
-        
-        self.curve_v.setPen(pg.mkPen(theme.chart_voltage, width=2))
-        self.curve_i.setPen(pg.mkPen(theme.chart_current, width=2))
-        self.curve_p.setPen(pg.mkPen(theme.chart_power, width=2))
-        
-        if self.region:
-            self.region.setBrush(pg.mkBrush(theme.accent_primary + "30"))
-            self.region.setPen(pg.mkPen(theme.accent_primary, width=2))
-    
+        self.apply_style()
+
+    def apply_settings(self, settings) -> None:
+        self.settings = settings
+        visible = {"v": settings.show_voltage, "i": settings.show_current, "p": settings.show_power}
+        if visible != self._visible:
+            self._visible = visible
+            self._build()
+        else:
+            for c in self._curves.values():
+                c.opts["antialias"] = settings.antialias
+            self.apply_style()
+            self.refresh()
+
+    def set_series_visible(self, key: str, visible: bool) -> None:
+        if self._visible.get(key) == visible:
+            return
+        self._visible[key] = visible
+        self._build()
+
+    # ----------------------------------------------------------------- data
+
+    def set_data(self, samples: Samples) -> None:
+        self._data = samples
+
     def clear_data(self) -> None:
-        """Clear all plot data and reset view."""
-        self.curve_v.setData([], [])
-        self.curve_i.setData([], [])
-        self.curve_p.setData([], [])
-        self.remove_region_selector()
-        
-        # Reset state
-        self._auto_scroll = True
-        self._window_seconds = self.DEFAULT_WINDOW_SECONDS
-        self._last_data_time = 0.0
-        
-        # Reset X range to start from 0
-        self._is_panning = True
-        self.plot_v.setXRange(0, self._window_seconds, padding=0)
-        self._is_panning = False
-        
-        # Clear crosshair data
-        self._current_data = (np.array([]), np.array([]), np.array([]), np.array([]))
-    
-    def reset_to_live(self) -> None:
-        """Reset to live auto-scrolling view (same as middle-click)."""
-        self._auto_scroll = True
-        self._update_view_range()
-    
-    def show_full_range(self, t_min: float, t_max: float) -> None:
-        """Show the full time range (for export view).
-        
-        Disables auto-scroll and sets view to show all data.
-        """
-        self._auto_scroll = False
-        duration = t_max - t_min
-        self._window_seconds = max(duration, self.MIN_WINDOW_SECONDS)
-        
-        # Add small padding
-        padding = duration * 0.02 if duration > 0 else 0.5
-        
-        self._is_panning = True
-        self.plot_v.setXRange(t_min - padding, t_max + padding, padding=0)
-        self._is_panning = False
-    
-    # -------------------------------------------------------------------------
-    # Settings configuration
-    # -------------------------------------------------------------------------
-    
-    def set_grid(self, show: bool, alpha: float = 0.2) -> None:
-        """Configure grid visibility and opacity."""
-        self._show_grid = show
-        self._grid_alpha = alpha
-        for plot in [self.plot_v, self.plot_i, self.plot_p]:
-            plot.showGrid(x=show, y=show, alpha=alpha)
-    
-    def set_crosshair(self, show: bool) -> None:
-        """Enable/disable crosshair cursor."""
-        self._show_crosshair = show
-        if not show:
-            for vline in self._crosshair_lines:
-                vline.setVisible(False)
-    
+        # Not named clear(): GraphicsLayoutWidget binds `clear` to the layout's
+        # clear() as an instance attribute, which would shadow it and wipe the scene.
+        self._data = Samples.empty()
+        for c in self._curves.values():
+            c.setData([], [])
+        self._region_values = None
+        for r in self._regions:
+            r.setVisible(False)
+        self._set_x_range(0.0, self._window_s)
+        if not self.overview:
+            self.set_follow(True)
+
+    def refresh(self) -> None:
+        """Redraw the visible slice of the current data."""
+        s = self._data
+        if not len(s) or not self._plots:
+            return
+        t = s.t
+        if self._follow and not self.overview:
+            end = float(t[-1])
+            self._set_x_range(max(0.0, end - self._window_s) if end > self._window_s else 0.0,
+                              max(end, self._window_s))
+        x0, x1 = self._first_plot().viewRange()[0]
+        span = x1 - x0
+        a = max(0, int(np.searchsorted(t, x0 - span * 0.02)) - 1)
+        b = min(len(t), int(np.searchsorted(t, x1 + span * 0.02)) + 1)
+        xs = t[a:b]
+        width_px = max(200, int(self.width()))
+        # Antialiased lines wider than 1 px cost up to seconds per repaint on
+        # dense, noisy curves (Qt path stroking) and froze the window; once
+        # there are more points than pixels a 1 px line looks the same.
+        dense = (b - a) > 1.5 * width_px
+        if dense != self._dense:
+            self._dense = dense
+            self._apply_pens()
+        for key, curve in self._curves.items():
+            curve.setData(*_decimate(xs, getattr(s, key)[a:b], width_px))
+
+    def show_all(self) -> None:
+        s = self._data
+        if len(s) >= 2:
+            t0, t1 = float(s.t[0]), float(s.t[-1])
+            pad = (t1 - t0) * 0.01
+            self._set_x_range(t0 - pad, t1 + pad)
+        self.refresh()
+
+    def zoom_to(self, t0: float, t1: float) -> None:
+        if t1 > t0:
+            self.set_follow(False)
+            self._set_x_range(t0, t1)
+            self.refresh()
+
+    # ------------------------------------------------------- follow / window
+
+    @property
+    def follow(self) -> bool:
+        return self._follow
+
+    def set_follow(self, follow: bool) -> None:
+        follow = bool(follow) and not self.overview
+        if follow != self._follow:
+            self._follow = follow
+            self.follow_changed.emit(follow)
+        if follow:
+            self.refresh()
+
     @property
     def window_seconds(self) -> float:
-        """Current time window size in seconds."""
-        return self._window_seconds
-    
-    @window_seconds.setter
-    def window_seconds(self, value: float) -> None:
-        """Set time window size."""
-        self._window_seconds = max(
-            self.MIN_WINDOW_SECONDS,
-            min(self.MAX_WINDOW_SECONDS, value)
-        )
-        if self._auto_scroll:
-            self._update_view_range()
+        return self._window_s
+
+    def set_window_seconds(self, seconds: float) -> None:
+        self._window_s = float(min(max(seconds, self.MIN_WINDOW_S), self.MAX_WINDOW_S))
+        if self._follow:
+            self.refresh()
+        else:
+            x0, x1 = self._first_plot().viewRange()[0]
+            c = (x0 + x1) / 2
+            self._set_x_range(c - self._window_s / 2, c + self._window_s / 2)
+            self.refresh()
+
+    def _first_plot(self) -> pg.PlotItem:
+        return next(iter(self._plots.values()))
+
+    def _set_x_range(self, x0: float, x1: float) -> None:
+        if not self._plots:
+            return
+        self._updating = True
+        try:
+            self._first_plot().setXRange(x0, x1, padding=0)
+        finally:
+            self._updating = False
+
+    def _on_x_range_changed(self, *_):
+        if self._updating:
+            return
+        # The user dragged the view: stop following the live edge.
+        if self._follow:
+            self._follow = False
+            self.follow_changed.emit(False)
+        self.refresh()
+        self.view_changed.emit()
+
+    # ---------------------------------------------------------------- mouse
+
+    def wheelEvent(self, event) -> None:
+        if not self._plots:
+            return
+        factor = 1 / self.ZOOM_FACTOR if event.angleDelta().y() > 0 else self.ZOOM_FACTOR
+        if self._follow:
+            self._window_s = float(min(max(self._window_s * factor, self.MIN_WINDOW_S),
+                                       self.MAX_WINDOW_S))
+            self.window_changed.emit(self._window_s)
+            self.refresh()
+        else:
+            x0, x1 = self._first_plot().viewRange()[0]
+            span = x1 - x0
+            anchor, frac = (x0 + x1) / 2, 0.5
+            pos = self.mapToScene(event.position().toPoint())
+            for plot in self._plots.values():
+                if plot.sceneBoundingRect().contains(pos):
+                    anchor = plot.getViewBox().mapSceneToView(pos).x()
+                    frac = (anchor - x0) / span if span > 0 else 0.5
+                    break
+            new_span = min(max(span * factor, self.MIN_WINDOW_S / 10), self.MAX_WINDOW_S * 24)
+            start = anchor - frac * new_span
+            self._set_x_range(start, start + new_span)
+            if not self.overview:
+                self._window_s = min(max(new_span, self.MIN_WINDOW_S), self.MAX_WINDOW_S)
+                self.window_changed.emit(self._window_s)
+            self.refresh()
+            self.view_changed.emit()
+        event.accept()
+
+    # -------------------------------------------------------------- markers
+
+    MARKER_PICK_PX = 8
+
+    def set_markers(self, markers) -> None:
+        self._markers = list(markers)
+        self._draw_markers()
+
+    def _draw_markers(self) -> None:
+        for line in self._marker_lines:
+            try:
+                for plot in self._plots.values():
+                    if line in plot.items:
+                        plot.removeItem(line)
+            except RuntimeError:
+                pass
+        self._marker_lines = []
+        if not self._plots:
+            return
+        color = pg.mkColor(self.theme.warning)
+        pen = pg.mkPen(color, width=1.5, style=Qt.DashLine)
+        hover = pg.mkPen(color, width=3)
+        first = True
+        for plot in self._plots.values():
+            for m in self._markers:
+                opts = {}
+                if first:
+                    opts = dict(label=m.label, labelOpts={
+                        "position": 0.9, "color": color, "anchors": [(-0.05, 0.5), (-0.05, 0.5)],
+                        "fill": pg.mkBrush(pg.mkColor(self.theme.surface)),
+                    })
+                line = pg.InfiniteLine(pos=m.t, angle=90, movable=self.overview, pen=pen,
+                                       hoverPen=hover, **opts)
+                line.setZValue(20)
+                line.marker_id = m.id
+                if self.overview:
+                    line.setCursor(Qt.SizeHorCursor)
+                    line.sigPositionChanged.connect(self._sync_marker_drag)
+                    line.sigPositionChangeFinished.connect(self._on_marker_dragged)
+                plot.addItem(line, ignoreBounds=True)
+                self._marker_lines.append(line)
+            first = False
+
+    def _sync_marker_drag(self, line) -> None:
+        # Keep the copies of the same marker on the other plots aligned.
+        x = line.value()
+        for other in self._marker_lines:
+            if other is not line and other.marker_id == line.marker_id and other.value() != x:
+                other.blockSignals(True)
+                other.setValue(x)
+                other.blockSignals(False)
+
+    def _on_marker_dragged(self, line) -> None:
+        self.marker_moved.emit(int(line.marker_id), float(line.value()))
+
+    def _time_at(self, scene_pos) -> Optional[Tuple[float, float]]:
+        """(time, seconds per pixel) under a scene position, or None."""
+        for plot in self._plots.values():
+            if plot.sceneBoundingRect().contains(scene_pos):
+                vb = plot.getViewBox()
+                x = vb.mapSceneToView(scene_pos).x()
+                x0, x1 = vb.viewRange()[0]
+                width = max(1.0, vb.sceneBoundingRect().width())
+                return x, (x1 - x0) / width
+        return None
+
+    def _marker_near(self, t: float, s_per_px: float) -> int:
+        best, best_d = 0, self.MARKER_PICK_PX * s_per_px
+        for m in self._markers:
+            d = abs(m.t - t)
+            if d <= best_d:
+                best, best_d = m.id, d
+        return best
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.RightButton:
+            hit = self._time_at(self.mapToScene(event.position().toPoint()))
+            if hit is not None:
+                t, spp = hit
+                self.context_requested.emit(t, self._marker_near(t, spp),
+                                            event.globalPosition().toPoint())
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        hit = self._time_at(self.mapToScene(event.position().toPoint()))
+        if hit is not None:
+            mid = self._marker_near(*hit)
+            if mid:
+                self.marker_activated.emit(mid)
+                event.accept()
+                return
+        if self.overview:
+            self.show_all()
+        else:
+            self.set_follow(True)
+        event.accept()
+
+    def _on_mouse_moved(self, pos) -> None:
+        if not self.settings.show_crosshair or not len(self._data):
+            return
+        for plot in self._plots.values():
+            if plot.sceneBoundingRect().contains(pos):
+                x = plot.getViewBox().mapSceneToView(pos).x()
+                for v in self._vlines:
+                    v.setPos(x)
+                    v.setVisible(True)
+                s = self._data
+                k = int(np.clip(np.searchsorted(s.t, x), 1, len(s) - 1))
+                if abs(s.t[k - 1] - x) < abs(s.t[k] - x):
+                    k -= 1
+                self.cursor_values.emit(float(s.t[k]), float(s.v[k]), float(s.i[k]), float(s.p[k]))
+                return
+        for v in self._vlines:
+            v.setVisible(False)
+        self.cursor_left.emit()
+
+    def leaveEvent(self, event) -> None:
+        for v in self._vlines:
+            v.setVisible(False)
+        self.cursor_left.emit()
+        super().leaveEvent(event)
+
+    # --------------------------------------------------------------- region
+
+    def set_region(self, t0: float, t1: float) -> None:
+        self._region_values = (min(t0, t1), max(t0, t1))
+        self._syncing_region = True
+        try:
+            for r in self._regions:
+                r.setRegion(self._region_values)
+                r.setVisible(True)
+        finally:
+            self._syncing_region = False
+        self.region_changed.emit()
+
+    def get_selected_range(self) -> Optional[Tuple[float, float]]:
+        return self._region_values
+
+    def _on_region_moved(self, region: pg.LinearRegionItem) -> None:
+        if self._syncing_region:
+            return
+        lo, hi = region.getRegion()
+        self._region_values = (float(lo), float(hi))
+        self._syncing_region = True
+        try:
+            for r in self._regions:
+                if r is not region:
+                    r.setRegion(self._region_values)
+        finally:
+            self._syncing_region = False
+        self.region_changed.emit()

@@ -1,21 +1,9 @@
-"""EdgePowerMeter application package."""
+"""EdgePowerMeter application package.
 
-from .version import __version__, __version_info__, APP_NAME
-from .core import Measurement, MeasurementRecord, Statistics, AppSettings
-from .serial import SerialReader, SerialConfig
-from .export import ReportGenerator, CSVImporter
+Kept import-light on purpose: subprocesses such as the GPU probe import
+`app.*` modules and must not pay for Qt widgets, numpy or reportlab.
+"""
 
-__all__ = [
-    "main",
-    "__version__",
-    "__version_info__",
-    "APP_NAME",
-    "Measurement",
-    "MeasurementRecord",
-    "Statistics",
-    "AppSettings",
-    "SerialReader",
-    "SerialConfig",
-    "ReportGenerator",
-    "CSVImporter",
-]
+from .version import APP_NAME, __version__, __version_info__
+
+__all__ = ["__version__", "__version_info__", "APP_NAME"]

@@ -92,8 +92,14 @@ def _reexec(mode: str) -> None:
     env[_MODE_ENV_VAR] = mode
     try:
         # Frozen builds: argv[0] is the executable itself, do not pass it twice.
-        args = sys.argv[1:] if _frozen() else sys.argv
-        os.execve(sys.executable, [sys.executable] + args, env)
+        # Otherwise always restart as a module: with "-m app.main" sys.argv[0]
+        # is the path of app/main.py, and running that file as a script puts
+        # app/ on sys.path, where app/serial shadows pyserial's "serial".
+        if _frozen():
+            argv = [sys.executable] + sys.argv[1:]
+        else:
+            argv = [sys.executable, "-m", "app.main"] + sys.argv[1:]
+        os.execve(sys.executable, argv, env)
     except OSError as e:
         # Can't replace the process image - apply what we can in-place and
         # keep going rather than crashing. The GL env vars may arrive too

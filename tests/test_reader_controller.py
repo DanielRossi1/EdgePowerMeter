@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pytest
 
 pytest.importorskip("PySide6.QtWidgets")
@@ -135,6 +136,22 @@ def test_seq_gaps_reported_as_lost(qapp):
     _pump(qapp, 1.0)
     r.stop()
     assert r.lost_samples > 10
+
+
+def test_device_left_streaming_raw_drops_stale_buffer(qapp):
+    port = FakePort("v2", stale_raw_lines=150)
+    r = _reader(port)
+    batches = []
+    r.samples_ready.connect(batches.append)
+    r.start()
+    _pump(qapp, 2.0, lambda: sum(len(b) for b in batches) > 300)
+    r.stop()
+    _pump(qapp, 0.1)
+    assert r.protocol == PROTO_V2
+    assert r.lost_samples == 0
+    t = np.concatenate([b.t for b in batches])
+    assert t[0] == 0.0
+    assert np.max(np.diff(t)) < 0.05        # no multi-second hole at the start
 
 
 def test_silence_warns_then_fails(qapp):

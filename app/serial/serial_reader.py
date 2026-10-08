@@ -309,6 +309,7 @@ class SerialReader(QtCore.QThread):
             # lines must not be mixed into the device-clock time base.
             self._decoder.raw_only = True
             self._decoder.discard_legacy_pending()
+            self._decoder.discard_raw_pending()
             self._decoder.reset_timebase()
         self.protocol_detected.emit(proto)
 

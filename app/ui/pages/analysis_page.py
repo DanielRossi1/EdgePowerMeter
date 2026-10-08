@@ -121,6 +121,7 @@ class AnalysisPage(QtWidgets.QWidget):
             ("irms", tr("Current RMS")),
         ])
         card.body.addWidget(self.sel_info)
+        card.body.addStretch()
         card.setMinimumWidth(330)
         card.setMaximumWidth(420)
         lay.addWidget(card)
@@ -133,9 +134,12 @@ class AnalysisPage(QtWidgets.QWidget):
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.ContiguousSelection)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        self.table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        self.table.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustToContents)
+        self.table.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
         self.table.setShowGrid(False)
         card2.body.addWidget(self.table)
+        card2.body.addStretch()
         lay.addWidget(card2, 1)
         return w
 

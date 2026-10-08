@@ -58,7 +58,7 @@ parts:
             "$CRAFT_PROJECT_DIR/README.md" "$CRAFT_PROJECT_DIR/LICENSE" "$CRAFT_PART_SRC/"
       find "$CRAFT_PART_SRC/app" -name "__pycache__" -type d -prune -exec rm -rf {} +
     python-packages:
-      - PySide6-Essentials>=6.4.0
+      - PySide6-Essentials>=6.4.0,<6.12  # 6.12.0 crashes on Python 3.10 (see pyproject.toml)
       - pyqtgraph>=0.13.0
       - pyserial>=3.5
       - reportlab>=4.0.0

@@ -433,6 +433,21 @@ class StreamDecoder:
         self._leg_t0 = None
         self._leg_last_t = 0.0
 
+    def discard_raw_pending(self) -> None:
+        """Drop buffered RAW samples and start counting losses afresh.
+
+        RAW lines that arrive before the session starts are stale when the
+        device was left streaming (the previous session ended without MODE
+        CSV, e.g. a crash): its USB buffer still holds old lines, followed by
+        a sequence gap that is no loss of this recording."""
+        for buf in (self._raw_seq, self._raw_t, self._raw_bus, self._raw_shunt):
+            buf.clear()
+        self._raw_last_t_us = None
+        self._host_ref = None       # may come from a stale line: wrong wall time
+        self.reset_sequence()
+        self.lost_samples = 0
+        self.missed_samples = 0
+
     def reset_sequence(self) -> None:
         """Forget the last seq/time (stream paused: the next gap is not a loss)."""
         self._last_seq = None

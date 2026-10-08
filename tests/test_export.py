@@ -93,3 +93,40 @@ def test_export_keeps_microamp_resolution(tmp_path: Path):
     p = tmp_path / "x.csv"
     export_csv(p, s)
     assert np.allclose(import_csv(p).i, i, rtol=1e-5)
+
+
+# The autouse fixture in conftest patches recorder.default_folder; this
+# reference was taken at import time, before the patch.
+from app.export.recorder import default_folder as real_default_folder  # noqa: E402
+
+
+def _snap_home(tmp_path: Path, monkeypatch, user_dirs: str = None) -> Path:
+    home = tmp_path / "home"
+    (home / "Documents").mkdir(parents=True)
+    (home / "Documenti").mkdir()
+    config = tmp_path / "snap-config"
+    config.mkdir()
+    if user_dirs is not None:
+        (config / "user-dirs.dirs").write_text(user_dirs.replace("<HOME>", str(home)))
+    monkeypatch.setenv("SNAP_REAL_HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+    return home
+
+
+def test_snap_recordings_follow_the_user_documents_dir(tmp_path: Path, monkeypatch):
+    # With both ~/Documents and ~/Documenti present, the configured one wins.
+    home = _snap_home(tmp_path, monkeypatch, 'XDG_DESKTOP_DIR="<HOME>/Scrivania"\n'
+                                             'XDG_DOCUMENTS_DIR="<HOME>/Documenti"\n')
+    assert real_default_folder() == home / "Documenti" / "EdgePowerMeter"
+
+
+def test_snap_recordings_fall_back_to_known_names(tmp_path: Path, monkeypatch):
+    home = _snap_home(tmp_path, monkeypatch)
+    assert real_default_folder() == home / "Documents" / "EdgePowerMeter"
+
+
+@pytest.mark.parametrize("value", ['"<HOME>"', '"/elsewhere/Docs"', '"<HOME>/Missing"', '"$HOME/Documenti"'])
+def test_snap_user_dirs_values(tmp_path: Path, monkeypatch, value):
+    home = _snap_home(tmp_path, monkeypatch, f"XDG_DOCUMENTS_DIR={value}\n")
+    expected = "Documenti" if value == '"$HOME/Documenti"' else "Documents"
+    assert real_default_folder() == home / expected / "EdgePowerMeter"

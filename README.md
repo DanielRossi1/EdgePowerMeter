@@ -74,48 +74,71 @@
 
 The EdgePowerMeter desktop application provides a modern interface for real-time power monitoring and data analysis.
 
-### Main Interface
-
-![EdgePowerMeter GUI](assets/prototype/app/gui.png)
-
 The window has a navigation rail with five pages: **Live**, **Analysis**,
-**Device**, **Settings** and **About**. The Live page shows three synchronized
-plots (voltage, current, power) with live value tiles; the Analysis page works
-on a selected range of the recording. (Screenshots below are from version 1.x.)
+**Device**, **Settings** and **About** (Ctrl+1…5).
 
-### Statistics Panel
+> The screenshots show simulated demo data (idle → model load → inference at
+> 10 FPS on a ~5 V rail); the Device page is taken from a real sensor.
 
-Real-time statistics are displayed in dedicated cards:
+### Live
 
-![Statistics Summary](assets/prototype/statistics/summary.png)
+![Live page](assets/screenshots/live.png)
 
-Each measurement type shows:
-- Minimum value
-- Maximum value
-- Average value
-- Total energy consumed (Wh)
+Three synchronized plots (voltage, current, power) with value tiles and running
+totals: energy, charge, peak power, duration, sample rate and lost samples.
+Drag the plots to look back and use the mouse wheel to change the time window;
+**Follow live** returns to the latest data. Press `M` (or the **Marker**
+button, or right-click a plot) to mark an event. Every acquisition is written
+to a CSV file while it runs, as shown in the status bar.
 
-### Derived Metrics
+### Analysis
 
-![Derived Metrics](assets/prototype/statistics/derived.png)
+![Analysis page](assets/screenshots/analysis.png)
 
-Advanced calculations including:
-- **Sampling rate** (Hz) - real-time display with configurable subsampling
-- **Voltage/Current ripple** - percentage and absolute values
-- **Power supply quality** - ripple, load regulation, settling time, stability rating
-- **Spectrum analysis** - dominant frequencies in load variations
-- **Power factor estimation** - for AC/DC systems
-- **Load impedance estimation** - dynamic resistance calculation
+Drag the highlighted region to select the range to analyze (or **Select all**),
+then switch between the tabs below the plot. **Statistics** gives duration,
+energy, charge, average power and current RMS of the selection plus min, max,
+average, standard deviation and peak-to-peak of each quantity.
 
-### Data Export
+**Markers** turns the marks into segments, each with its start, duration,
+average and peak power, energy and charge; click a row to select that segment.
 
-![Export Options](assets/prototype/app/gui-export.png)
+![Markers tab](assets/screenshots/analysis-markers.png)
 
-Export your data in multiple formats:
-- **CSV**: Full measurement history with timestamps
-- **PDF**: Professional report with statistics summary
+**Benchmark** computes energy per inference, inferences per joule and
+throughput per watt (FPS/W) for the selection or a segment, also net of the
+idle power measured in another segment, and can add them to the PDF report.
 
-![Export Summary](assets/prototype/app/export-summary.png)
+![Benchmark tab](assets/screenshots/analysis-benchmark.png)
+
+**Spectrum** shows where the load variation energy is concentrated (periodic
+bursts, throttling cycles, regulator ripple) with the dominant frequencies;
+**Power supply quality** rates the supply rail: voltage range, ripple, RMS
+noise, load regulation and settling time.
+
+![Spectrum tab](assets/screenshots/analysis-spectrum.png)
+
+**Export CSV** and **Export PDF** work on the selection or the whole
+recording; PDF reports include vector charts, statistics, markers, supply
+quality, spectrum and benchmark results.
+
+### Device
+
+![Device page](assets/screenshots/device.png)
+
+Connection and firmware details, clock synchronization of the DS3231 with the
+PC, INA226 averaging and conversion times (with presets from ~2 Hz to ~900 Hz,
+applied immediately and optionally saved on the device) and calibration of
+shunt value, current zero, gain and offset. Remote configuration and clock
+sync need firmware 2.x.
+
+### Settings
+
+![Settings page](assets/screenshots/settings.png)
+
+Language, theme, plot refresh rate and time window, line width, grid, units,
+significant digits, average-power mode, hardware acceleration and acquisition
+options.
 
 ---
 

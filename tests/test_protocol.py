@@ -156,3 +156,27 @@ def test_legacy_nan_values_rejected():
            b"2026-10-08 12:00:00.002,5.0,0.2,1.0\n")
     s = d.take_samples()
     assert len(s) == 1 and d.bad_lines == 2
+
+
+def test_session_start_drops_stale_raw_lines_and_their_gap():
+    """A device left streaming RAW (the app crashed) has old lines in its USB
+    buffer: they must not start the recording nor count as lost samples."""
+    clock = iter([100.0, 200.0]).__next__
+    d = P.StreamDecoder(clock=clock)
+    d.feed(b"D,1,1000000,3200,400\nD,2,1001000,3200,400\n")         # stale
+    d.feed(b"D,6001,7000000,3200,400\n")                            # gap
+    d.discard_raw_pending()                                          # session starts
+    d.reset_timebase()
+    d.feed(b"D,6005,7004000,3200,400\nD,6006,7005000,3200,400\n")
+    s = d.take_samples()
+    assert d.lost_samples == 0 and d.missed_samples == 0
+    assert s.t.tolist() == pytest.approx([0.0, 0.001])
+    assert s.wall[0] == pytest.approx(200.0)    # host reference from a fresh line
+
+
+def test_gap_after_session_start_is_a_real_loss():
+    d = _decoder()
+    d.discard_raw_pending()
+    d.feed(b"D,1,0,1,1\nD,5,4000,1,1\n")
+    assert d.lost_samples == 3
+    assert len(d.take_samples()) == 2

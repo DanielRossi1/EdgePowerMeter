@@ -197,6 +197,19 @@ def test_reexec_calls_execve_with_mode_marker(monkeypatch):
     assert env["LIBGL_ALWAYS_SOFTWARE"] == "1"
 
 
+def test_reexec_restarts_as_module_not_as_script(monkeypatch):
+    # Started with "python -m app.main", sys.argv[0] is the path of main.py.
+    # Re-running that path as a script put app/ on sys.path and made
+    # "import serial" load app/serial instead of pyserial (snap 2.0.0 crash).
+    calls = []
+    monkeypatch.setattr(gpu_preflight.os, "execve", lambda path, argv, env: calls.append(argv))
+    monkeypatch.setattr(gpu_preflight.sys, "argv", ["/snap/x/app/main.py", "--flag"])
+
+    gpu_preflight._reexec(gpu_preflight.MODE_NVIDIA_PRIME)
+
+    assert calls == [[gpu_preflight.sys.executable, "-m", "app.main", "--flag"]]
+
+
 def test_reexec_failure_does_not_raise(monkeypatch):
     def _raise(*a, **kw):
         raise OSError("execve not permitted")

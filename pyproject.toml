@@ -31,7 +31,11 @@ classifiers = [
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "PySide6-Essentials>=6.4.0",  # Core/Gui/Widgets/Svg/OpenGL only: no WebEngine & co.
+    # Core/Gui/Widgets/Svg/OpenGL only: no WebEngine & co.
+    # 6.12.0 drops a reference to None on every call that returns nothing:
+    # harmless on Python >= 3.12 (immortal None), a crash within seconds of
+    # acquisition on 3.10/3.11 (snap core22, release builds).
+    "PySide6-Essentials>=6.4.0,<6.12",
     "pyqtgraph>=0.13.0",
     "pyserial>=3.5",
     "reportlab>=4.0.0",

@@ -10,13 +10,16 @@ class FakePort:
 
     def __init__(self, firmware: str = "v2", rate_hz: float = 1000.0, silent: bool = False,
                  boot_delay_s: float = 0.0, disconnect_after_s: float = 0.0,
-                 skip_seq_every: int = 0):
+                 skip_seq_every: int = 0, stale_raw_lines: int = 0):
         self.firmware = firmware
         self.rate_hz = rate_hz
         self.silent = silent
         self.boot_delay_s = boot_delay_s
         self.disconnect_after_s = disconnect_after_s
         self.skip_seq_every = skip_seq_every
+        # >0: the device is still streaming RAW from a session that ended
+        # without MODE CSV; its USB buffer holds that many old lines.
+        self.stale_raw_lines = stale_raw_lines
         self.port = "/dev/fake"
         self.written: List[str] = []
         self.mode = "CSV"
@@ -29,6 +32,12 @@ class FakePort:
 
     def open(self):
         self._t_start = self._last_emit = time.monotonic()
+        if self.stale_raw_lines:
+            self.mode = "RAW"
+            self._out = self._lines(self.stale_raw_lines)
+            # Samples taken while nobody read the port and the buffer was full.
+            self._seq += 5000
+            self._t_us += 5000 * int(1e6 / self.rate_hz)
 
     def close(self):
         self.closed = True

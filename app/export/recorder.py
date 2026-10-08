@@ -41,12 +41,35 @@ def user_home() -> Path:
 _DOCUMENTS_NAMES = ("Documents", "Documenti", "Dokumente", "Documentos", "Documenten")
 
 
+def _snap_documents_dir(home: Path) -> Optional[Path]:
+    """XDG_DOCUMENTS_DIR from the copy of user-dirs.dirs the snap's desktop
+    launcher keeps in $XDG_CONFIG_HOME, with the real paths already expanded
+    (the original in the real ~/.config is a hidden file, not readable)."""
+    config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    try:
+        lines = (Path(config) / "user-dirs.dirs").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in lines:
+        key, _, value = line.strip().partition("=")
+        if key != "XDG_DOCUMENTS_DIR":
+            continue
+        value = value.strip().strip('"').replace("$HOME", str(home))
+        path = Path(value)
+        # Only a real folder inside the real home, and not the home itself
+        # (that is what user-dirs uses for "no documents folder").
+        if path.is_absolute() and path != home and home in path.parents and path.is_dir():
+            return path
+    return None
+
+
 def default_folder() -> Path:
     """~/Documents/EdgePowerMeter (or ~/EdgePowerMeter without a Documents dir)."""
     if os.environ.get("SNAP_REAL_HOME"):
-        # The snap cannot read ~/.config/user-dirs.dirs (hidden file), so
-        # look for the usual localized Documents folder names instead.
         home = user_home()
+        docs = _snap_documents_dir(home)
+        if docs is not None:
+            return docs / "EdgePowerMeter"
         for name in _DOCUMENTS_NAMES:
             if (home / name).is_dir():
                 return home / name / "EdgePowerMeter"

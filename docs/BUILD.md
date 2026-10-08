@@ -19,7 +19,7 @@ This guide explains how to build EdgePowerMeter as a standalone executable for d
 
 ```bash
 # Required packages
-pip install PySide6 pyqtgraph pyserial reportlab numpy
+pip install -e .
 
 # Build tools
 pip install pyinstaller
@@ -102,7 +102,7 @@ edgepowermeter
 1. Install [Python 3.8+](https://www.python.org/downloads/)
 2. Install dependencies:
    ```cmd
-   pip install PySide6 pyqtgraph pyserial reportlab numpy pyinstaller
+   pip install -e . pyinstaller
    ```
 
 ### Building
@@ -150,7 +150,7 @@ Name: "{commondesktop}\EdgePowerMeter"; Filename: "{app}\EdgePowerMeter.exe"
 ### Prerequisites
 
 ```bash
-pip install PySide6 pyqtgraph pyserial reportlab numpy pyinstaller
+pip install -e . pyinstaller
 ```
 
 ### Building
@@ -316,7 +316,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: pip install PySide6 pyqtgraph pyserial reportlab numpy pyinstaller
+      - run: pip install -e . pyinstaller
       - run: python build.py all
       - uses: actions/upload-artifact@v4
         with:
@@ -330,7 +330,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: pip install PySide6 pyqtgraph pyserial reportlab numpy pyinstaller
+      - run: pip install -e . pyinstaller
       - run: python build.py exe
       - uses: actions/upload-artifact@v4
         with:
@@ -344,7 +344,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: pip install PySide6 pyqtgraph pyserial reportlab numpy pyinstaller
+      - run: pip install -e . pyinstaller
       - run: python build.py exe
       - uses: actions/upload-artifact@v4
         with:

@@ -12,6 +12,7 @@ and hardware in [HARDWARE.md](HARDWARE.md), packaging in [BUILD.md](BUILD.md).
 - [Modules](#modules)
 - [User interface](#user-interface)
 - [Translations](#translations)
+- [Command line](#command-line)
 - [Settings](#settings)
 - [Export formats](#export-formats)
 - [Testing](#testing)
@@ -106,6 +107,12 @@ Connection rules (see `app/ui/controller.py`):
 | `app/ui/widgets/plot_widget.py` | Stacked V/I/P plots: live (follow) and overview (selection region) modes. |
 | `app/ui/file_actions.py` | Import/export dialogs running in a background thread with progress. |
 | `app/core/gpu_*.py` | Pre-start OpenGL probe and fallback (default / NVIDIA offload / software). |
+| `app/api/schema.py` | Tool registry (names, descriptions, JSON Schemas), discovery file and token helpers. Qt-free. Single source for HTTP, MCP and the docs. |
+| `app/api/service.py` | `ApiService`: implements every tool. Controller and settings access runs on the GUI thread. |
+| `app/api/server.py` | `ApiServer`: localhost HTTP server (`/api/v1`), Host/Origin and bearer-token checks, discovery file. |
+| `app/api/mcp_bridge.py` | `edgepowermeter --mcp`: MCP over stdio, proxied to the running app's HTTP API. Stdlib only, no Qt. |
+| `app/api/headless.py` | `edgepowermeter --headless`: API and acquisition without a window (QCoreApplication). |
+| `app/api/__init__.py` | Package marker with the Qt-free schema re-exports. |
 
 ---
 
@@ -188,6 +195,21 @@ The language defaults to the operating-system language and can be changed in
 Settings; the window is rebuilt in place without losing data.
 
 ---
+
+## Command line
+
+| Option | Effect |
+|--------|--------|
+| *(none)* | Desktop application. |
+| `--api` | Enable the automation API for this session only (not saved). |
+| `--api-port N` | Automation API port for this session (0 = any free port, headless only). |
+| `--headless` | No window: API and acquisition only. Skips the GPU preflight. |
+| `--port DEV` | With `--headless --start`: serial port to use. |
+| `--start` | With `--headless`: start the acquisition at startup (suggested port if `--port` is not given). |
+| `--mcp` | MCP bridge for AI agents on stdin/stdout. No Qt is loaded. |
+
+Other options are passed on to Qt (for example `-platform offscreen`). See
+[API.md](API.md) for the automation API, its security model and the MCP setup.
 
 ## Settings
 

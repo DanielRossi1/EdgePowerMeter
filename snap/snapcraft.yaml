@@ -1,5 +1,5 @@
 name: edgepowermeter
-version: '2.0.0'
+version: '2.1.0'
 title: EdgePowerMeter
 summary: Real-time power analyser for embedded AI workloads
 description: |
@@ -13,6 +13,7 @@ description: |
   - Continuous crash-safe recording to CSV, CSV import/export, PDF reports
   - Power supply quality and frequency spectrum analysis
   - Remote sensor configuration, clock sync and calibration (firmware 2.x)
+  - Automation API and MCP server for AI agents (see docs/API.md)
   - English, Italian, Spanish, French and German user interface
   - Dark, light or system theme
 
@@ -42,9 +43,17 @@ apps:
     plugs:
       - home
       - network
+      - network-bind   # automation API on 127.0.0.1 (see docs/API.md)
       - serial-port
       - raw-usb
       - hardware-observe
+
+  # MCP bridge for AI agents: `edgepowermeter.mcp`. Talks to the running app's
+  # localhost API through the shared snap data folder; needs no serial access.
+  mcp:
+    command: bin/edgepowermeter-mcp
+    plugs:
+      - network
 
 parts:
   edgepowermeter:
@@ -88,6 +97,12 @@ parts:
       exec $SNAP/bin/python3 -m app.main "$@"
       EOF
       chmod +x $SNAPCRAFT_PART_INSTALL/bin/edgepowermeter
+      cat > $SNAPCRAFT_PART_INSTALL/bin/edgepowermeter-mcp << 'EOF'
+      #!/bin/bash
+      cd $SNAP
+      exec $SNAP/bin/python3 -m app.main --mcp "$@"
+      EOF
+      chmod +x $SNAPCRAFT_PART_INSTALL/bin/edgepowermeter-mcp
 
   desktop-file:
     plugin: dump

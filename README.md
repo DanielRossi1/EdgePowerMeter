@@ -307,6 +307,19 @@ command set (`HELLO`, `GET`, `SET AVG/VCT/ICT/OLED/STREAM/SHUNT`, `SYNC`, `SAVE`
 screen /dev/ttyACM0 2000000
 ```
 
+### Automation API (AI agents)
+
+EdgePowerMeter can be driven by AI agents and scripts: a localhost HTTP API and an MCP
+server. Enable it on the Settings page (*Automation API (AI agents)*), or run `edgepowermeter --api` for one
+session, or `edgepowermeter --headless` without a window. For Claude Code:
+
+```bash
+claude mcp add edgepowermeter -- edgepowermeter --mcp
+```
+
+The API listens on `127.0.0.1` only and every request needs a token. See
+[docs/API.md](docs/API.md) for the security model, the tools and example workflows.
+
 ### Calculating FPS per Watt
 
 ```
@@ -376,6 +389,7 @@ EdgePowerMeter/
 │   └── OLEDStatus.h/cpp      # Non-blocking OLED display
 ├── app/
 │   ├── main.py               # Bootstrap (GPU preflight, QApplication)
+│   ├── api/                  # Automation API: HTTP server, MCP bridge, headless mode
 │   ├── core/                 # Samples store, statistics, PSU quality, spectrum, settings
 │   ├── serial/               # Port I/O, protocol decoder, reader thread
 │   ├── export/               # CSV import/export, PDF report, unit formatting
@@ -383,7 +397,7 @@ EdgePowerMeter/
 │   └── ui/                   # Main window, controller, pages, widgets, theme
 ├── tools/i18n/               # Offline machine-translation tool
 ├── tests/                    # pytest suite (headless, fake device)
-├── docs/                     # BUILD, HARDWARE, SOFTWARE, PROTOCOL
+├── docs/                     # BUILD, HARDWARE, SOFTWARE, PROTOCOL, API
 ├── Manufacture/              # PCB production files
 └── Schematics/               # Circuit diagrams
 ```

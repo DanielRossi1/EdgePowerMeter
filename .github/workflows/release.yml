@@ -253,8 +253,24 @@ jobs:
           name: macos-arm-builds
           path: dist/EdgePowerMeter-apple-silicon.zip
 
+  build-snap:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Build snap
+        id: build
+        uses: snapcore/action-build@v1
+
+      - name: Upload snap artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: snap-amd64
+          path: ${{ steps.build.outputs.snap }}
+
   upload-release:
-    needs: [build-linux-amd64, build-linux-arm64, build-windows, build-macos-intel, build-macos-arm]
+    needs: [build-linux-amd64, build-linux-arm64, build-windows, build-macos-intel, build-macos-arm, build-snap]
     runs-on: ubuntu-24.04
     if: github.event_name == 'release'
     steps:
@@ -295,6 +311,9 @@ jobs:
           
           # macOS Apple Silicon
           cp artifacts/macos-arm-builds/EdgePowerMeter-apple-silicon.zip release/EdgePowerMeter-${VERSION}-macos-apple-silicon.zip
+
+          # Snap (amd64)
+          cp artifacts/snap-amd64/*.snap release/EdgePowerMeter-${VERSION}-amd64.snap
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v3

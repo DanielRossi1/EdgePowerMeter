@@ -73,13 +73,21 @@ class SerialPortHandler:
                 first_error = e1
         else:
             first_error = None
+        ser = None
         try:
-            self._ser = serial.Serial(self.port, self.baud, timeout=0.05, write_timeout=0.5)
+            ser = serial.Serial(self.port, self.baud, timeout=0.05, write_timeout=0.5)
             time.sleep(0.05)
-            self._ser.reset_input_buffer()
+            ser.reset_input_buffer()
         except Exception as e2:
+            if ser is not None:
+                # Opened but not usable: release it (a Windows port stays locked).
+                try:
+                    ser.close()
+                except Exception:
+                    pass
             detail = f"{first_error}; {e2}" if first_error else str(e2)
             raise ConnectionError(detail) from e2
+        self._ser = ser
 
     def _open_direct(self) -> None:
         fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -138,6 +146,10 @@ class SerialPortHandler:
                     view = view[n:]
                 except BlockingIOError:
                     if time.monotonic() > deadline:
+                        if len(view) < len(data):
+                            # Part of the line is already in the device's input
+                            # buffer: end it so it cannot glue onto the next command.
+                            self._end_partial_line()
                         raise TimeoutError("serial write timed out")
                     select.select([], [self._fd], [], 0.05)
                 except OSError as e:
@@ -145,8 +157,26 @@ class SerialPortHandler:
         elif self._ser is not None:
             try:
                 self._ser.write(data)
+            except serial.SerialTimeoutException as e:
+                # Not drained within write_timeout: the device is alive, so this
+                # is not a disconnect (same as the POSIX path). pyserial does not
+                # report how much was written, so the line is ended
+                # unconditionally: an empty line is ignored by the firmware.
+                self._end_partial_line()
+                raise TimeoutError("serial write timed out") from e
             except (serial.SerialException, OSError) as e:
                 raise DeviceDisconnected(str(e)) from e
+
+    def _end_partial_line(self) -> None:
+        """Best effort: terminate a line that may be half sent, so it cannot
+        glue onto the next command. An empty line is a no-op in the firmware."""
+        try:
+            if self._fd is not None:
+                os.write(self._fd, b"\n")
+            elif self._ser is not None:
+                self._ser.write(b"\n")
+        except (OSError, serial.SerialException):
+            pass    # the device is not draining its input
 
     def close(self) -> None:
         if self._fd is not None:

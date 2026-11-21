@@ -10,11 +10,14 @@ Rules:
   * An *unexpected* disconnect (USB unplugged, port hung up) keeps the data
     and, with auto-reconnect enabled, polls for the port to come back and
     then appends to the same recording, bridging the gap in the time axis.
+  * Clear never deletes a recording file: during a live run the current file
+    is closed as a normal recording and a fresh one is started.
 """
 
 from __future__ import annotations
 
 import time
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +45,17 @@ SOURCE_LIVE = "live"
 SOURCE_IMPORT = "import"
 
 
+def _disconnect_quietly(signal) -> None:
+    """Disconnect all slots of a signal without PySide's RuntimeWarning
+    ("Failed to disconnect ... ") when there were none to begin with."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        try:
+            signal.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+
+
 class AcquisitionController(QtCore.QObject):
     state_changed = QtCore.Signal(str)
     data_appended = QtCore.Signal()
@@ -50,11 +64,15 @@ class AcquisitionController(QtCore.QObject):
     device_changed = QtCore.Signal()
     device_log = QtCore.Signal(str)
     command_reply = QtCore.Signal(bool, str, str)
+    device_info_received = QtCore.Signal(object)     # DeviceInfo (!HELLO)
+    device_config_received = QtCore.Signal(object)   # DeviceConfig (!CFG)
     clock_synced = QtCore.Signal(str)
     # level: 'info' | 'warning' | 'error'
     message = QtCore.Signal(str, str)
     markers_changed = QtCore.Signal()
     recording_changed = QtCore.Signal()
+    # Emitted from a retired reader's thread when it ends; _reap runs on the GUI thread.
+    _reader_done = QtCore.Signal(object)
 
     RECONNECT_POLL_MS = 1000
     RECORDING_FLUSH_MS = 1000
@@ -94,6 +112,13 @@ class AcquisitionController(QtCore.QObject):
         # Readers stopped during this recording: batches they emitted just
         # before stopping are still queued and belong to the recording.
         self._retired: list = []
+        # Readers whose thread outlived stop(): deleted once the thread ended.
+        self._stopping: list = []
+        # (vid, pid, serial number) of the port at Start, to follow a device
+        # that comes back under another name (ttyACM0 -> ttyACM1).
+        self._usb_id: Optional[tuple] = None
+        # A Start whose port has not opened yet: the data is replaced on port_opened.
+        self._start_pending = False
 
         self.markers = MarkerList()
         # Continuous recording to disk (live sessions with autosave enabled).
@@ -107,6 +132,7 @@ class AcquisitionController(QtCore.QObject):
         self._reconnect_timer = QtCore.QTimer(self)
         self._reconnect_timer.setInterval(self.RECONNECT_POLL_MS)
         self._reconnect_timer.timeout.connect(self._poll_reconnect)
+        self._reader_done.connect(self._reap, QtCore.Qt.QueuedConnection)
 
     # ----------------------------------------------------------- properties
 
@@ -152,28 +178,46 @@ class AcquisitionController(QtCore.QObject):
         return Path(d).expanduser() if d else recorder.default_folder()
 
     def start(self, port: str) -> None:
-        """Begin a new recording on `port` (caller confirmed discarding data)."""
+        """Begin a new recording on `port` (caller confirmed discarding data).
+
+        The existing data, markers and recording file are only replaced once
+        the port has opened (see `_on_port_opened`): if it cannot be opened,
+        they are left untouched."""
         self._stop_reader()
         self._reconnect_timer.stop()
-        self._finish_recording()
-        self.clear()
         self.port = port
-        self.source = SOURCE_LIVE
-        self.source_name = port
-        self._t_offset = 0.0
         self._resume_host_time = None
-        self._last_host_time = 0.0
-        self._rebase_next = False
-        self._open_recording()
+        self._start_pending = True
         self._open_reader()
+
+    def _on_port_opened(self) -> None:
+        if not self._from_current_reader() or not self._start_pending:
+            return
+        self._start_pending = False
+        self._usb_id = self._usb_identity(self.port)
+        self.source = SOURCE_LIVE
+        self.source_name = self.port
+        self._t_offset = 0.0
+        self._last_host_time = 0.0
+        # clear() discards the old data and opens the new recording file (the
+        # reader is CONNECTING, so it counts as running). Its time-axis rebase
+        # is not wanted here: a new session keeps the device's own time base.
+        self.clear()
+        self._rebase_next = False
 
     def stop(self) -> None:
         self._reconnect_timer.stop()
         was_running = self.reader is not None
         self._stop_reader()
         self._set_state(STATE_IDLE)
-        if was_running and self.writer is not None and self.writer.is_open:
-            QtCore.QTimer.singleShot(self.RECORDING_FINISH_DELAY_MS, self._finish_recording)
+        w = self.writer
+        if w is None or not w.is_open:
+            return
+        if was_running:
+            # Only this writer is finished: a Start within the delay opens a new one.
+            QtCore.QTimer.singleShot(self.RECORDING_FINISH_DELAY_MS, lambda: self._finish_writer(w))
+        else:
+            self._finish_writer(w)
 
     def _release_retired(self) -> None:
         for r in self._retired:
@@ -189,14 +233,15 @@ class AcquisitionController(QtCore.QObject):
         self.store.clear()
         self.stats.reset()
         self.has_unsaved_data = False
-        self.lost_samples = self._lost_base = 0
+        self.lost_samples = 0
+        # lost_samples adds the live reader's cumulative count: re-base it.
+        self._lost_base = -self.reader.lost_samples if self.reader is not None else 0
         self.gaps = 0
         self.markers.clear()
         if self.is_running:
-            # The data on disk is discarded too and a fresh file started.
-            if self.writer is not None:
-                self.writer.discard()
-                self.writer = None
+            # The current file is kept as a normal recording (Clear never
+            # deletes data on disk) and a fresh one is started.
+            self._finish_recording()
             self._open_recording()
         else:
             self._finish_recording()
@@ -304,7 +349,7 @@ class AcquisitionController(QtCore.QObject):
             self.writer = RecordingWriter(self.recordings_folder(),
                                           CsvFormat(s.csv_separator, s.csv_decimal, s.csv_time_format))
             self._flush_timer.start()
-        except OSError as e:
+        except (OSError, ValueError) as e:      # ValueError: e.g. a NUL byte in the path
             self.message.emit("warning", tr(
                 "Cannot save the recording in {folder}: {error}. The data is kept in memory only.",
                 folder=str(self.recordings_folder()), error=str(e)))
@@ -326,13 +371,23 @@ class AcquisitionController(QtCore.QObject):
             self.recording_changed.emit()
 
     def _finish_recording(self) -> None:
-        self._flush_timer.stop()
-        w = self.writer
+        self._finish_writer(self.writer)
+
+    def _finish_writer(self, w: Optional[RecordingWriter]) -> None:
+        """Close `w`; a too-short recording is removed. Only the current writer
+        owns the flush timer and the UI state."""
         if w is None or not w.is_open:
             return
+        current = w is self.writer
+        if current:
+            self._flush_timer.stop()
         kept = w.close()
+        if not current:
+            return
         if not kept:
             self.writer = None
+            if len(self.store):
+                self.has_unsaved_data = True   # the samples now exist only in memory
         elif not w.error:
             self.has_unsaved_data = False
         self.recording_changed.emit()
@@ -370,6 +425,7 @@ class AcquisitionController(QtCore.QObject):
                          no_data_timeout_s=s.no_data_timeout_s,
                          sync_clock=s.sync_clock_on_connect)
         q = QtCore.Qt.QueuedConnection
+        r.port_opened.connect(self._on_port_opened, q)
         r.samples_ready.connect(self._on_samples, q)
         r.protocol_detected.connect(self._on_protocol, q)
         r.device_info.connect(self._on_device_info, q)
@@ -392,6 +448,7 @@ class AcquisitionController(QtCore.QObject):
 
     def _stop_reader(self) -> None:
         r, self.reader = self.reader, None
+        self._start_pending = False
         if r is None:
             return
         r.stop()
@@ -399,24 +456,30 @@ class AcquisitionController(QtCore.QObject):
         # ending (including its final flush) are still queued, and PySide6
         # discards queued calls of a disconnected signal. They are accepted as
         # the tail of the recording while the reader is "retired".
-        for sig in (r.protocol_detected, r.device_info, r.device_config,
+        for sig in (r.port_opened, r.protocol_detected, r.device_info, r.device_config,
                     r.command_reply, r.device_log, r.clock_synced, r.data_stale,
                     r.data_resumed, r.error, r.disconnected, r.finished):
-            try:
-                sig.disconnect()
-            except (RuntimeError, TypeError):
-                pass
+            _disconnect_quietly(sig)
         self._lost_base += r.lost_samples
         self._retired.append(r)
         if len(self._retired) > 8:
             self._release(self._retired.pop(0))
 
-    @staticmethod
-    def _release(r) -> None:
-        try:
-            r.samples_ready.disconnect()
-        except (RuntimeError, TypeError):
-            pass
+    def _release(self, r) -> None:
+        _disconnect_quietly(r.samples_ready)
+        if r.isRunning():
+            # stop() timed out: the thread may still be running, and deleting a
+            # running QThread aborts the process. Delete it once it has ended.
+            self._stopping.append(r)
+            # finished fires on the reader thread: only forward the object. The
+            # queued _reader_done signal delivers it to _reap on the GUI thread.
+            r.finished.connect(lambda r=r: self._reader_done.emit(r))
+        else:
+            r.deleteLater()
+
+    def _reap(self, r) -> None:
+        if any(x is r for x in self._stopping):
+            self._stopping = [x for x in self._stopping if x is not r]
         r.deleteLater()
 
     def _from_current_reader(self) -> bool:
@@ -492,12 +555,14 @@ class AcquisitionController(QtCore.QObject):
             return
         self.device_info = info
         self.device_changed.emit()
+        self.device_info_received.emit(info)
 
     def _on_device_config(self, cfg: DeviceConfig) -> None:
         if not self._from_current_reader():
             return
         self.device_config = cfg
         self.device_changed.emit()
+        self.device_config_received.emit(cfg)
 
     def _on_command_reply(self, ok: bool, cmd: str, msg: str) -> None:
         if self._from_current_reader():
@@ -569,6 +634,7 @@ class AcquisitionController(QtCore.QObject):
             self._reconnect_timer.start()
         else:
             self._set_state(STATE_IDLE)
+            self._finish_writer(self.writer)
             self.message.emit("error", tr("Device disconnected."))
 
     def _on_reader_finished(self) -> None:
@@ -577,13 +643,49 @@ class AcquisitionController(QtCore.QObject):
                 and self._resume_host_time is None:
             self._stop_reader()
             self._set_state(STATE_IDLE)
+            self._finish_writer(self.writer)
+
+    @staticmethod
+    def _identity_of(info) -> Optional[tuple]:
+        """(vid, pid, serial number) of a USB serial port info, or None if unknown.
+        Without a serial number two identical adapters cannot be told apart."""
+        if info is None:
+            return None
+        serial = getattr(info, "serial_number", None)
+        if getattr(info, "vid", None) is None or not serial:
+            return None
+        return (info.vid, getattr(info, "pid", None), serial)
+
+    @classmethod
+    def _usb_identity(cls, port: str) -> Optional[tuple]:
+        return cls._identity_of(PortDiscovery.get_port_info(port))
+
+    def _reconnect_target(self) -> Optional[str]:
+        """The port to reopen now, or None. Enumerates the ports exactly once."""
+        if self._usb_id is None:
+            # Identity unknown: the old name is the only handle on the device.
+            return self.port if self.port in PortDiscovery.list_ports() else None
+        # Identity known: follow the device by identity only. A different device
+        # that took over the old name must not be opened as if it were ours.
+        ports = PortDiscovery.snapshot()
+        if self.port in ports and self._identity_of(ports[self.port]) == self._usb_id:
+            return self.port
+        for name, info in ports.items():
+            if self._identity_of(info) == self._usb_id:
+                return name       # the same device came back under another name
+        return None
 
     def _poll_reconnect(self) -> None:
         if self.state != STATE_RECONNECTING or not self.port:
             self._reconnect_timer.stop()
             return
-        if self.port in PortDiscovery.list_ports():
+        port = self._reconnect_target()
+        if port is not None:
             self._reconnect_timer.stop()
+            if port != self.port:
+                # The same device came back under another name.
+                self.port = port
+                self.source_name = port
             self._open_reader()
             # _open_reader moved us to CONNECTING; samples will flip it to
             # STREAMING and bridge the time axis.

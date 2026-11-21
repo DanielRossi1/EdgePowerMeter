@@ -177,3 +177,29 @@ def test_live_session_is_saved_with_markers(qapp, monkeypatch, _isolated_recordi
     assert len(data) == len(ctrl.store)
     assert markers.get(m.id).label == "after stop"
     ctrl.shutdown()
+
+
+def test_marker_segments_partition_energy():
+    rng = np.random.default_rng(3)
+    n = 3000
+    t = np.arange(n) / 100.0
+    p = rng.uniform(0.5, 3.0, n)
+    v = np.full(n, 5.0)
+    data = Samples.from_columns(t, t, v, p / 5.0, v * (p / 5.0))
+    ml = MarkerList()
+    for m in (3.017, 3.02, 11.5, 20.0, 27.333):    # off-sample and coincident times
+        ml.add(m)
+    segs = ml.segments(data)
+    total = Statistics.from_samples(data).energy_wh
+    # A one-sample segment (the two near-coincident markers) has no statistics.
+    assert sum(s.stats.energy_wh for s in segs if s.stats) == pytest.approx(total, rel=1e-9)
+    assert sum(s.stats.charge_ah for s in segs if s.stats) == pytest.approx(
+        Statistics.from_samples(data).charge_ah, rel=1e-9)
+
+
+def test_apply_line_rejects_non_finite_time():
+    ml = MarkerList()
+    assert ml.apply_line("#MARKER\t1\tnan\tbad") is False
+    assert ml.apply_line("#MARKER\t2\tinf\tbad") is False
+    assert ml.apply_line("#MARKER\t3\t1.5\tgood") is True
+    assert [(m.id, m.t) for m in ml.sorted()] == [(3, 1.5)]

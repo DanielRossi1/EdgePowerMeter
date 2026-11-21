@@ -2,12 +2,43 @@
 
 from __future__ import annotations
 
+import json
+from typing import Dict
+
 from PySide6 import QtCore, QtWidgets
 
 from ...core import AppSettings
 from ...i18n import LANGUAGES, tr
 from ...serial import SerialConfig
-from ..widgets.common import Card, FormGrid, button, combo, confirm, scroll_page, spin
+from ..widgets.common import Card, FormGrid, button, combo, confirm, label, scroll_page, spin
+
+# Snippets copied by "Copy MCP config" (the MCP bridge is `edgepowermeter --mcp`).
+MCP_ADD_COMMAND = "claude mcp add edgepowermeter -- edgepowermeter --mcp"
+MCP_CONFIG_JSON = json.dumps(
+    {"mcpServers": {"edgepowermeter": {"command": "edgepowermeter", "args": ["--mcp"]}}},
+    indent=2)
+
+
+def _show(widget, value) -> None:
+    """Set a bound widget to `value` without emitting its change signal."""
+    widget.blockSignals(True)
+    try:
+        if isinstance(widget, QtWidgets.QComboBox):
+            idx = widget.findData(value)
+            if idx >= 0:
+                widget.setCurrentIndex(idx)
+        elif isinstance(widget, QtWidgets.QCheckBox):
+            widget.setChecked(bool(value))
+        elif isinstance(widget, QtWidgets.QAbstractSpinBox):
+            widget.setValue(value)
+        elif isinstance(widget, QtWidgets.QPlainTextEdit):
+            if widget.toPlainText() != value:
+                widget.setPlainText(value)
+        elif isinstance(widget, QtWidgets.QLineEdit):
+            if widget.text() != value:
+                widget.setText(value)
+    finally:
+        widget.blockSignals(False)
 
 
 class SettingsPage(QtWidgets.QWidget):
@@ -17,6 +48,7 @@ class SettingsPage(QtWidgets.QWidget):
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self._bound: Dict[str, QtWidgets.QWidget] = {}   # setting name -> its widget
         s = settings
         body = QtWidgets.QWidget()
         col = QtWidgets.QVBoxLayout(body)
@@ -91,6 +123,7 @@ class SettingsPage(QtWidgets.QWidget):
         self.folder_edit.editingFinished.connect(
             lambda: self._update("recordings_dir", self.folder_edit.text().strip()))
         folder_row.addWidget(self.folder_edit, 1)
+        self._bound["recordings_dir"] = self.folder_edit
         browse = button(tr("Choose..."))
         browse.clicked.connect(self._choose_folder)
         folder_row.addWidget(browse)
@@ -120,14 +153,60 @@ class SettingsPage(QtWidgets.QWidget):
         title = QtWidgets.QLineEdit(s.report_title)
         title.setPlaceholderText(tr("Power measurement report"))
         title.editingFinished.connect(lambda: self._update("report_title", title.text()))
+        self._bound["report_title"] = title
         f.add(tr("Report title"), title)
         notes = QtWidgets.QPlainTextEdit(s.report_notes)
         notes.setPlaceholderText(tr("Optional notes printed under the title (device under test, model, conditions...)"))
         notes.setFixedHeight(70)
         notes.textChanged.connect(lambda: self._update("report_notes", notes.toPlainText()))
+        self._bound["report_notes"] = notes
         f.add(tr("Report notes"), notes)
         card.body.addLayout(f)
         col.addWidget(card)
+
+        # ------------------------------------------------ automation API
+        card = Card(tr("Automation API (AI agents)"),
+                    tr("Lets AI agents and scripts read the meter and control it (start, mark, "
+                       "measure, export). Only this computer can connect, and every request needs "
+                       "the token below."))
+        f = FormGrid()
+        f.add_full(self._check("api_enabled", tr("Enable the automation API")),
+                   tr("Takes effect immediately. It is also available for one session with "
+                      "the --api option."))
+        f.add(tr("Port"), self._spin("api_port", 1024, 65535, 0, 1, on_finish=True),
+              tr("TCP port on 127.0.0.1 (localhost only)."))
+        self.api_status_label = label("")
+        f.add(tr("Status"), self.api_status_label)
+        self.api_url_label = label("")
+        self.api_url_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        f.add(tr("Address"), self.api_url_label)
+        token_row = QtWidgets.QHBoxLayout()
+        token_row.setContentsMargins(0, 0, 0, 0)
+        self.api_token_edit = QtWidgets.QLineEdit()
+        self.api_token_edit.setReadOnly(True)
+        self.api_token_edit.setMinimumWidth(240)
+        token_row.addWidget(self.api_token_edit, 1)
+        copy_token = button(tr("Copy"))
+        copy_token.clicked.connect(
+            lambda: QtWidgets.QApplication.clipboard().setText(self.settings.api_token))
+        token_row.addWidget(copy_token)
+        regen = button(tr("Regenerate"), "flat")
+        regen.clicked.connect(self._regenerate_token)
+        token_row.addWidget(regen)
+        holder = QtWidgets.QWidget()
+        holder.setLayout(token_row)
+        f.add(tr("Token"), holder,
+              tr("Clients send it as 'Authorization: Bearer <token>'. It is also written to the "
+                 "discovery file, which only your user can read."))
+        mcp_btn = button(tr("Copy MCP config"))
+        mcp_btn.clicked.connect(self._copy_mcp_config)
+        f.add(tr("MCP server"), mcp_btn,
+              tr("Copies the setup for Claude Code and for MCP clients that use an mcpServers "
+                 "file. Claude Code: run the copied 'claude mcp add' command once."))
+        f.add_full(self._mono_label(MCP_ADD_COMMAND))
+        card.body.addLayout(f)
+        col.addWidget(card)
+        self._sync_api()
 
         row = QtWidgets.QHBoxLayout()
         row.addStretch()
@@ -149,23 +228,72 @@ class SettingsPage(QtWidgets.QWidget):
         setattr(self.settings, name, value)
         self.settings.validate()
         self.settings.save()
+        if name.startswith("api_"):
+            self._sync_api()
         self.changed.emit(name)
+
+    def refresh_from_settings(self) -> None:
+        """Show the current settings after they changed elsewhere (e.g. through the API)."""
+        for name, widget in self._bound.items():
+            _show(widget, getattr(self.settings, name))
+        self._sync_api()
+
+    def _sync_api(self) -> None:
+        self.api_token_edit.setText(self.settings.api_token)
+
+    def set_api_status(self, text: str, color: str, tooltip: str = "", url: str = "") -> None:
+        """Show whether the API server is running and where (set by the main window).
+
+        `url` is the address actually in use: it can differ from the saved
+        port when the app was started with --api-port.
+        """
+        self.api_status_label.setText(text)
+        self.api_status_label.setStyleSheet(f"color: {color};")
+        self.api_status_label.setToolTip(tooltip)
+        if url:
+            self.api_url_label.setText(url)
+
+    def _regenerate_token(self) -> None:
+        if not confirm(self, tr("Regenerate token"),
+                       tr("Programs using the current token will be disconnected. Continue?"),
+                       tr("Regenerate"), tr("Cancel")):
+            return
+        from ...api.schema import generate_token
+        self._update("api_token", generate_token())
+
+    def _copy_mcp_config(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(MCP_ADD_COMMAND + "\n\n" + MCP_CONFIG_JSON)
+
+    @staticmethod
+    def _mono_label(text: str) -> QtWidgets.QLabel:
+        lab = label(text)
+        lab.setStyleSheet("font-family: monospace;")
+        lab.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        return lab
 
     def _combo(self, name: str, items) -> QtWidgets.QComboBox:
         c = combo(items, getattr(self.settings, name))
         c.currentIndexChanged.connect(lambda _: self._update(name, c.currentData()))
+        self._bound[name] = c
         return c
 
     def _check(self, name: str, text: str) -> QtWidgets.QCheckBox:
         c = QtWidgets.QCheckBox(text)
         c.setChecked(bool(getattr(self.settings, name)))
         c.toggled.connect(lambda on: self._update(name, on))
+        self._bound[name] = c
         return c
 
-    def _spin(self, name: str, lo, hi, decimals, step, suffix=""):
+    def _spin(self, name: str, lo, hi, decimals, step, suffix="", on_finish: bool = False):
+        """on_finish: apply on editingFinished (Enter or focus-out) instead of every step.
+        Needed for settings whose change has side effects, such as restarting the API."""
         sp = spin(lo, hi, getattr(self.settings, name), decimals, step, suffix)
         cast = int if decimals == 0 else float
-        sp.valueChanged.connect(lambda v: self._update(name, cast(v)))
+        if on_finish:
+            sp.editingFinished.connect(lambda: self._update(name, cast(sp.value())))
+        else:
+            sp.valueChanged.connect(lambda v: self._update(name, cast(v)))
+        self._bound[name] = sp
         return sp
 
     def _choose_folder(self) -> None:
@@ -182,7 +310,8 @@ class SettingsPage(QtWidgets.QWidget):
                        tr("Reset all settings (including calibration) to their defaults?"),
                        tr("Reset"), tr("Cancel")):
             return
-        keep = {"last_dir": self.settings.last_dir}
+        # The API token stays: a reset must not lock out clients that already use it.
+        keep = {"last_dir": self.settings.last_dir, "api_token": self.settings.api_token}
         fresh = AppSettings(**keep)
         for k, v in fresh.as_dict().items():
             setattr(self.settings, k, v)

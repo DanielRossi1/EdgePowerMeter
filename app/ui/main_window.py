@@ -8,6 +8,8 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from ..api.schema import generate_token
+from ..api.server import ApiServer
 from ..core import AppSettings, CPUUsageMonitor
 from ..i18n import set_language, tr
 from ..version import APP_NAME, __version__
@@ -30,6 +32,8 @@ PAGE_LIVE, PAGE_ANALYSIS, PAGE_DEVICE, PAGE_SETTINGS, PAGE_ABOUT = range(5)
 
 # Settings whose change requires rebuilding the widgets (texts or colors).
 _REBUILD_KEYS = {"language", "theme", "*"}
+# Settings that start, stop or restart the automation API.
+_API_KEYS = ("api_enabled", "api_port", "api_token")
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -37,9 +41,18 @@ class MainWindow(QtWidgets.QMainWindow):
     SLOW_INTERVAL_MS = 1000
     PORT_SCAN_MS = 2000
 
-    def __init__(self, gpu_mode: str = "default"):
+    def __init__(self, gpu_mode: str = "default", api_override: bool = False,
+                 api_port_override: Optional[int] = None):
         super().__init__()
         self.settings = AppSettings.load()
+        if not self.settings.api_token:
+            self.settings.api_token = generate_token()
+            self.settings.save()
+        # --api / --api-port: this session only, nothing is persisted.
+        self._api_override = api_override
+        self._api_port_override = api_port_override
+        self.api: Optional[ApiServer] = None
+        self._api_error = ""
         self._qt_translator: Optional[QtCore.QTranslator] = None
         self._apply_language()
         self.gpu_mode = gpu_mode
@@ -51,6 +64,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._data_dirty = False
         self._page_index = PAGE_LIVE
         self._software_banner = False
+        self._markers_timer = QtCore.QTimer(self)
+        self._markers_timer.setSingleShot(True)
+        self._markers_timer.setInterval(10)
+        self._markers_timer.timeout.connect(self._apply_markers)
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.setMinimumSize(1100, 720)
@@ -68,6 +85,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_timers()
         self._setup_shortcuts()
         self._restore_geometry()
+        self._apply_api()
 
     # ------------------------------------------------------------- building
 
@@ -160,12 +178,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(root)
 
         self._build_status_bar()
+        self._refresh_api_label()
         self._refresh_nav_icons()
         self._show_page(self._page_index)
         self._refresh_ports()
         self._on_state_changed(self.ctrl.state)
         self._on_data_reset()
-        self._on_markers_changed()
+        self._apply_markers()
         self._update_recording_label()
 
     def _build_top_bar(self) -> QtWidgets.QWidget:
@@ -227,6 +246,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cursor_label = label("")
         self.cursor_label.setStyleSheet("font-family: monospace;")
         sb.addPermanentWidget(self.cursor_label)
+        self.api_label = label("")
+        sb.addPermanentWidget(self.api_label)
         self.rec_button = QtWidgets.QToolButton()
         self.rec_button.setAutoRaise(True)
         self.rec_button.setCursor(QtCore.Qt.PointingHandCursor)
@@ -311,6 +332,72 @@ class MainWindow(QtWidgets.QMainWindow):
         if old is not None:
             old.deleteLater()
 
+    # ---------------------------------------------------------- API server
+
+    def _apply_api(self) -> None:
+        """Start, restart or stop the automation API to match the settings.
+
+        The server is owned by the window, not by a page, so rebuilding the
+        widgets (language or theme change) leaves it running.
+        """
+        s = self.settings
+        enabled = s.api_enabled or self._api_override
+        port = self._effective_api_port()
+        self._stop_api()
+        self._api_error = ""
+        if enabled:
+            server = ApiServer(self.ctrl, s, port=port, token=s.api_token, parent=self,
+                               on_settings_changed=self._on_api_settings_changed)
+            try:
+                server.start()
+            except OSError as exc:
+                server.deleteLater()
+                self._api_error = str(exc)
+                self.statusBar().showMessage(self._api_error, 15000)
+            else:
+                self.api = server
+        self._refresh_api_label()
+
+    def _effective_api_port(self) -> int:
+        """The port the API uses this session: --api-port wins over the saved one."""
+        if self._api_port_override is not None:
+            return self._api_port_override
+        return self.settings.api_port
+
+    def _stop_api(self) -> None:
+        if self.api is not None:
+            self.api.stop()
+            self.api.deleteLater()
+            self.api = None
+
+    def _on_api_settings_changed(self) -> None:
+        """A client changed settings through the API: show them in the settings page."""
+        self.settings_page.refresh_from_settings()
+        # Pages keep widgets bound to settings: refresh them, or their next
+        # edit writes the stale values back over the API's changes.
+        self.device.refresh_calibration()
+        self.analysis.sync_spectrum_signal()
+        self.statusBar().showMessage(tr("Settings changed by the automation API"), 6000)
+
+    def _refresh_api_label(self) -> None:
+        t = self.theme
+        if self.api is not None and self.api.running:
+            text, color = tr("API on, port {port}", port=self.api.port), t.success
+            tip = self.api.url
+            url = self.api.url
+        elif self._api_error:
+            text, color = tr("API error"), t.danger
+            tip = self._api_error
+            url = f"http://127.0.0.1:{self._effective_api_port()}"
+        else:
+            text, color = tr("API off"), t.text_muted
+            tip = tr("Automation API for AI agents (Settings page)")
+            url = f"http://127.0.0.1:{self._effective_api_port()}"
+        self.api_label.setText(text)
+        self.api_label.setStyleSheet(f"color: {color};")
+        self.api_label.setToolTip(tip)
+        self.settings_page.set_api_status(text, color, tip, url)
+
     def show_software_rendering_banner(self) -> None:
         self._software_banner = True
         self.gpu_banner.show()
@@ -339,6 +426,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.ctrl.is_running:
             self.ctrl.stop()
             return
+        if self.files.busy:
+            self.statusBar().showMessage(tr("Wait for the file operation to finish."), 6000)
+            return
         port = self.port_combo.currentData()
         if not port:
             QtWidgets.QMessageBox.information(self, tr("Start"), tr("Select a serial port first."))
@@ -350,6 +440,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_page(PAGE_LIVE)
 
     def _clear(self) -> None:
+        if self.files.busy:
+            self.statusBar().showMessage(tr("Wait for the file operation to finish."), 6000)
+            return
         if not self.files.confirm_discard():
             return
         self.ctrl.clear()
@@ -415,8 +508,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_state_changed(STATE_STREAMING)   # refresh the rate in the pill
 
     def _on_markers_changed(self) -> None:
-        markers = self.ctrl.markers.sorted()
-        self.live.plot.set_markers(markers)
+        # Coalesced: a burst of marker changes triggers one redraw.
+        self._markers_timer.start()
+
+    def _apply_markers(self) -> None:
+        self.live.plot.set_markers(self.ctrl.markers.sorted())
         self.analysis.on_markers_changed()
 
     def _update_recording_label(self) -> None:
@@ -509,7 +605,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ctrl.apply_calibration()
             self.cpu_bar.setVisible(s.show_cpu_usage)
             self.cpu_pct.setVisible(s.show_cpu_usage)
+            self._api_override = False
+            self._api_port_override = None
+            self._apply_api()
             return
+        if name == "api_enabled":
+            # An explicit on/off in the settings page replaces the --api options.
+            self._api_override = False
+            self._api_port_override = None
+        elif name == "api_port":
+            # A new port in the settings page wins over --api-port (--api stays on).
+            self._api_port_override = None
+        if name in _API_KEYS:
+            self._apply_api()
         if name == "plot_fps":
             self.frame_timer.start(int(1000 / s.plot_fps))
         if name == "show_cpu_usage":
@@ -550,6 +658,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
         QtCore.QSettings("EdgePowerMeter", "EdgePowerMeter").setValue(
             "window/geometry", self.saveGeometry())
+        self._stop_api()
         self.ctrl.shutdown()
         self.settings.save()
         event.accept()

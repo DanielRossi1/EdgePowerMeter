@@ -12,7 +12,7 @@ from PySide6 import QtCore, QtWidgets
 
 from ..core import Samples
 from ..export import ReportOptions, export_csv, export_pdf, format_duration, format_si
-from ..export.csv_io import import_recording
+from ..export.csv_io import import_recording_ex
 from ..export.recorder import user_home
 from ..i18n import tr
 from .controller import AcquisitionController
@@ -96,6 +96,10 @@ class FileActions(QtCore.QObject):
     # ------------------------------------------------------------- actions
 
     def import_csv(self) -> None:
+        if self.busy:
+            # A second import would race the first one's load() into the same store.
+            self.ctrl.message.emit("info", tr("An import or export is already running. Wait for it to finish."))
+            return
         if self.ctrl.is_running:
             QtWidgets.QMessageBox.information(self.parent_widget, tr("Import"),
                                               tr("Stop acquisition before importing data."))
@@ -110,17 +114,26 @@ class FileActions(QtCore.QObject):
         self._remember_dir(path)
 
         def done(result) -> None:
-            samples, markers = result
+            if self.ctrl.is_running:
+                # Started while the file was read: loading would stop the acquisition.
+                QtWidgets.QMessageBox.information(
+                    self.parent_widget, tr("Import"),
+                    tr("The file was not imported because acquisition was started meanwhile. "
+                       "Stop acquisition and import it again."))
+                return
+            samples, markers, skipped = result
             self.ctrl.load(samples, Path(path).name, markers)
             text = tr("{n} samples imported ({duration}) from {file}.",
                       n=f"{len(samples):,}", duration=format_duration(samples.duration),
                       file=Path(path).name)
             if len(markers):
                 text += "\n" + tr("{n} markers", n=len(markers))
+            if skipped:
+                text += "\n" + tr("{n} unreadable rows were skipped.", n=skipped)
             QtWidgets.QMessageBox.information(self.parent_widget, tr("Import completed"), text)
 
         self._run(tr("Reading {file}...", file=Path(path).name),
-                  lambda progress: import_recording(Path(path), progress), done)
+                  lambda progress: import_recording_ex(Path(path), progress), done)
 
     def _mark_saved_if_unchanged(self, n: int) -> None:
         # Samples recorded while the export ran are not in the file.
@@ -131,7 +144,8 @@ class FileActions(QtCore.QObject):
         """Whole live recording already on disk: offer the file instead of a
         duplicate. Returns True when the caller must not export."""
         path = self.ctrl.recording_path
-        if path is None or self.ctrl.is_recording_to_disk is None:
+        writer = self.ctrl.writer
+        if path is None or writer is None or writer.error:
             return False
         box = QtWidgets.QMessageBox(self.parent_widget)
         box.setIcon(QtWidgets.QMessageBox.Information)

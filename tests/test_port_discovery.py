@@ -131,3 +131,17 @@ def test_scan_devices_individually_isolates_per_device_failure(monkeypatch, tmp_
     # Falls back to a bare ListPortInfo carrying just the device path.
     assert len(result) == 1
     assert result[0].device == '/dev/ttyUSB0'
+
+
+def test_snapshot_enumerates_once_and_keys_by_device(monkeypatch):
+    calls = []
+    ports = [_fake_port('/dev/ttyACM0'), _fake_port('/dev/ttyACM1')]
+    monkeypatch.setattr(
+        PortDiscovery, '_comports',
+        classmethod(lambda cls: calls.append(1) or list(ports)),
+    )
+
+    snap = PortDiscovery.snapshot()
+
+    assert len(calls) == 1
+    assert snap == {'/dev/ttyACM0': ports[0], '/dev/ttyACM1': ports[1]}

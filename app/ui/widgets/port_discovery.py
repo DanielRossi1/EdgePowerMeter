@@ -5,7 +5,7 @@ from __future__ import annotations
 import glob
 import re
 import sys
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from serial.tools import list_ports
 from serial.tools.list_ports_common import ListPortInfo
@@ -128,6 +128,16 @@ class PortDiscovery:
             List of port device names (e.g., ['/dev/ttyUSB0', 'COM3'])
         """
         return [p.device for p in cls._comports()]
+
+    @classmethod
+    def snapshot(cls) -> Dict[str, ListPortInfo]:
+        """All ports from a single enumeration, as {device: info}.
+
+        Callers that need several facts about the ports (names and USB
+        identities) should use this: list_ports()/get_port_info() each
+        enumerate again, so looping them over ports costs N+1 scans.
+        """
+        return {p.device: p for p in cls._comports()}
 
     @classmethod
     def get_port_info(cls, port_name: str) -> Optional[ListPortInfo]:

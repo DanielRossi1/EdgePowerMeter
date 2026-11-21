@@ -32,6 +32,11 @@ class AnalysisPage(QtWidgets.QWidget):
         # While True the selection tracks the whole (growing) recording.
         self._select_all_mode = True
         self._setting_region = False
+        # Marker bursts (e.g. many additions in a row) refresh once, not per change.
+        self._markers_timer = QtCore.QTimer(self)
+        self._markers_timer.setSingleShot(True)
+        self._markers_timer.setInterval(10)
+        self._markers_timer.timeout.connect(self._apply_markers)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 12)
@@ -378,8 +383,10 @@ class AnalysisPage(QtWidgets.QWidget):
                  "poor": t.danger}.get(q.stability_rating, "")
         self.psu_info.set("nominal", format_si(q.nominal_voltage, "V"))
         self.psu_info.set("range", f"{format_si(q.min_voltage, 'V')} … {format_si(q.max_voltage, 'V')}")
-        self.psu_info.set("ripple", f"{format_si(q.voltage_ripple_mv / 1000, 'V')} "
-                                    f"({q.voltage_ripple_percent:.3f} %)")
+        ripple = format_si(q.voltage_ripple_mv / 1000, 'V')
+        if q.voltage_ripple_percent == q.voltage_ripple_percent:   # not NaN (0 V rail has none)
+            ripple += f" ({q.voltage_ripple_percent:.3f} %)"
+        self.psu_info.set("ripple", ripple)
         self.psu_info.set("noise", format_si(q.rms_noise, "V"))
         self.psu_info.set("rating", rating_label(q.stability_rating), color)
         self.psu_info.set("loadreg", "-" if q.load_regulation_percent is None
@@ -455,6 +462,10 @@ class AnalysisPage(QtWidgets.QWidget):
         return w
 
     def on_markers_changed(self) -> None:
+        """Schedule one refresh; a burst of changes within the timer interval coalesces."""
+        self._markers_timer.start()
+
+    def _apply_markers(self) -> None:
         self.plot.set_markers(self.ctrl.markers.sorted())
         self._dirty_tabs.update({3, 4})
         self._update_current_tab()
@@ -467,8 +478,8 @@ class AnalysisPage(QtWidgets.QWidget):
             st = seg.stats
             cells = [seg.name, f"{seg.start:.3f} s", format_duration(seg.end - seg.start)]
             if st is not None:
-                cells += [format_si(st.energy_wh * 3600 / st.duration_seconds, "W")
-                          if st.duration_seconds > 0 else "-",
+                cells += [format_si(st.energy_wh * 3600 / st.connected_seconds, "W")
+                          if st.connected_seconds > 0 else "-",
                           format_si(st.power_max, "W"), format_si(st.energy_wh, "Wh"),
                           format_si(st.charge_ah, "Ah")]
             else:
@@ -580,8 +591,8 @@ class AnalysisPage(QtWidgets.QWidget):
         self.bench_idle.addItem(tr("Not considered"), ("none", None))
         self.bench_idle.addItem(tr("Typed value"), ("manual", None))
         for seg in segs:
-            if seg.stats is not None and seg.stats.duration_seconds > 0:
-                p = seg.stats.energy_wh * 3600 / seg.stats.duration_seconds
+            if seg.stats is not None and seg.stats.connected_seconds > 0:
+                p = seg.stats.energy_wh * 3600 / seg.stats.connected_seconds
                 self.bench_idle.addItem(f"{seg.name}  ({format_si(p, 'W')})", ("seg", p))
         idx = self.bench_idle.findData(cur_idle) if cur_idle else 0
         self.bench_idle.setCurrentIndex(max(0, idx))

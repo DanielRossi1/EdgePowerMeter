@@ -13,6 +13,8 @@ to the pixel width, so redraw cost does not grow with recording length.
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -93,6 +95,20 @@ def _decimate(x: np.ndarray, y: np.ndarray, width_px: int) -> Tuple[np.ndarray, 
     return xs, ys
 
 
+def _escape_label(text: str) -> str:
+    """pyqtgraph runs InfiniteLine labels through str.format (with a {value}
+    field), so braces in a marker label must be doubled to show literally."""
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+@dataclass
+class _MarkerLines:
+    """The lines drawn for one marker: one per plot, and what they show."""
+    t: float
+    label: str
+    lines: List[Tuple[pg.PlotItem, pg.InfiniteLine]]
+
+
 SERIES: Tuple[Tuple[str, str, str], ...] = (
     ("v", N_("Voltage"), "V"),
     ("i", N_("Current"), "A"),
@@ -136,7 +152,7 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self._region_values: Optional[Tuple[float, float]] = None
         self._markers: list = []                      # Marker objects
         self._dense = False
-        self._marker_lines: List[pg.InfiniteLine] = []
+        self._marker_items: Dict[int, _MarkerLines] = {}   # marker id -> drawn lines
         self._syncing_region = False
 
         self.setBackground(theme.plot_bg)
@@ -152,7 +168,7 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self._plots.clear()
         self._curves.clear()
         self._vlines.clear()
-        self._marker_lines = []
+        self._marker_items = {}          # the lines live in the plots that ci.clear() removes
         self._regions.clear()
 
         keys = [k for k, _, _ in SERIES if self._visible[k]] or ["p"]
@@ -307,8 +323,9 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         s = self._data
         if len(s) >= 2:
             t0, t1 = float(s.t[0]), float(s.t[-1])
-            pad = (t1 - t0) * 0.01
-            self._set_x_range(t0 - pad, t1 + pad)
+            if math.isfinite(t0) and math.isfinite(t1):
+                pad = (t1 - t0) * 0.01
+                self._set_x_range(t0 - pad, t1 + pad)
         self.refresh()
 
     def zoom_to(self, t0: float, t1: float) -> None:
@@ -349,7 +366,8 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         return next(iter(self._plots.values()))
 
     def _set_x_range(self, x0: float, x1: float) -> None:
-        if not self._plots:
+        # pyqtgraph throws "Cannot set range [-inf, inf]" on non-finite bounds.
+        if not self._plots or not (math.isfinite(x0) and math.isfinite(x1)):
             return
         self._updating = True
         try:
@@ -406,46 +424,78 @@ class PlotWidget(pg.GraphicsLayoutWidget):
         self._markers = list(markers)
         self._draw_markers()
 
+    @property
+    def _marker_lines(self) -> List[pg.InfiniteLine]:
+        return [line for entry in self._marker_items.values() for _, line in entry.lines]
+
     def _draw_markers(self) -> None:
-        for line in self._marker_lines:
-            try:
-                for plot in self._plots.values():
-                    if line in plot.items:
-                        plot.removeItem(line)
-            except RuntimeError:
-                pass
-        self._marker_lines = []
+        """Bring the drawn lines in line with self._markers.
+
+        Diffed by marker id, so a change touches only the markers that changed:
+        removed ones lose their lines, a moved one is repositioned, a relabelled
+        one is redrawn and new ones get lines. Rebuilding every line on every
+        change made N additions cost O(N^2) pyqtgraph items.
+        """
         if not self._plots:
             return
+        wanted = {m.id: m for m in self._markers}
+        for mid in [mid for mid in self._marker_items if mid not in wanted]:
+            self._remove_marker_lines(mid)
+        for mid, m in wanted.items():
+            entry = self._marker_items.get(mid)
+            if entry is None:
+                self._add_marker_lines(m)
+            elif entry.label != m.label:
+                self._remove_marker_lines(mid)
+                self._add_marker_lines(m)
+            elif entry.t != m.t:
+                entry.t = m.t
+                for _, line in entry.lines:
+                    line.setValue(m.t)
+
+    def _add_marker_lines(self, m) -> None:
         color = pg.mkColor(self.theme.warning)
         pen = pg.mkPen(color, width=1.5, style=Qt.DashLine)
         hover = pg.mkPen(color, width=3)
-        first = True
-        for plot in self._plots.values():
-            for m in self._markers:
-                opts = {}
-                if first:
-                    opts = dict(label=m.label, labelOpts={
-                        "position": 0.9, "color": color, "anchors": [(-0.05, 0.5), (-0.05, 0.5)],
-                        "fill": pg.mkBrush(pg.mkColor(self.theme.surface)),
-                    })
-                line = pg.InfiniteLine(pos=m.t, angle=90, movable=self.overview, pen=pen,
-                                       hoverPen=hover, **opts)
-                line.setZValue(20)
-                line.marker_id = m.id
-                if self.overview:
-                    line.setCursor(Qt.SizeHorCursor)
-                    line.sigPositionChanged.connect(self._sync_marker_drag)
-                    line.sigPositionChangeFinished.connect(self._on_marker_dragged)
-                plot.addItem(line, ignoreBounds=True)
-                self._marker_lines.append(line)
-            first = False
+        lines: List[Tuple[pg.PlotItem, pg.InfiniteLine]] = []
+        for idx, plot in enumerate(self._plots.values()):
+            opts = {}
+            if idx == 0:     # the label is drawn once, on the top plot
+                opts = dict(label=_escape_label(m.label), labelOpts={
+                    "position": 0.9, "color": color, "anchors": [(-0.05, 0.5), (-0.05, 0.5)],
+                    "fill": pg.mkBrush(pg.mkColor(self.theme.surface)),
+                })
+            line = pg.InfiniteLine(pos=m.t, angle=90, movable=self.overview, pen=pen,
+                                   hoverPen=hover, **opts)
+            line.setZValue(20)
+            line.marker_id = m.id
+            if self.overview:
+                line.setCursor(Qt.SizeHorCursor)
+                line.sigPositionChanged.connect(self._sync_marker_drag)
+                line.sigPositionChangeFinished.connect(self._on_marker_dragged)
+            plot.addItem(line, ignoreBounds=True)
+            lines.append((plot, line))
+        self._marker_items[m.id] = _MarkerLines(m.t, m.label, lines)
+
+    def _remove_marker_lines(self, marker_id: int) -> None:
+        entry = self._marker_items.pop(marker_id, None)
+        if entry is None:
+            return
+        for plot, line in entry.lines:
+            try:
+                if line in plot.items:
+                    plot.removeItem(line)
+            except RuntimeError:       # already deleted with its scene
+                pass
 
     def _sync_marker_drag(self, line) -> None:
         # Keep the copies of the same marker on the other plots aligned.
+        entry = self._marker_items.get(line.marker_id)
+        if entry is None:
+            return
         x = line.value()
-        for other in self._marker_lines:
-            if other is not line and other.marker_id == line.marker_id and other.value() != x:
+        for _, other in entry.lines:
+            if other is not line and other.value() != x:
                 other.blockSignals(True)
                 other.setValue(x)
                 other.blockSignals(False)

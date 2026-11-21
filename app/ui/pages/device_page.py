@@ -16,6 +16,9 @@ from ..controller import (STATE_CONNECTING, STATE_IDLE, STATE_RECONNECTING, STAT
                           STATE_STREAMING, AcquisitionController)
 from ..widgets.common import Card, FormGrid, KeyValueList, button, combo, label, scroll_page, spin
 
+# Shunt values outside this range are accepted but flagged (usual current-sense resistors).
+SHUNT_TYPICAL_OHM = (0.0005, 1.0)
+
 # (name, avg, bus conversion µs, shunt conversion µs)
 PRESETS = (
     (N_("Fast"), 4, 140, 140),
@@ -157,8 +160,11 @@ class DevicePage(QtWidgets.QWidget):
         self.v_gain = spin(0.5, 2.0, s.voltage_gain, 5, 0.0001)
         cform.add(tr("Voltage gain"), self.v_gain)
         cal.body.addLayout(cform)
+        self.shunt_hint = label("", "Hint")          # non-blocking sanity warning
+        cal.body.addWidget(self.shunt_hint)
         for sp in (self.shunt, self.i_offset, self.i_gain, self.v_offset, self.v_gain):
             sp.valueChanged.connect(self._on_calibration_changed)
+        self._update_shunt_hint()
         r = QtWidgets.QHBoxLayout()
         reset = button(tr("Reset calibration"), "flat")
         reset.clicked.connect(self._reset_calibration)
@@ -348,6 +354,21 @@ class DevicePage(QtWidgets.QWidget):
         else:
             self._log(tr("Not connected."))
 
+    def refresh_calibration(self) -> None:
+        """Show the calibration from settings (they may have changed through the API).
+
+        Must run before any spin edit, otherwise the next edit writes the stale
+        values of the other spins back to settings.
+        """
+        s = self.ctrl.settings
+        for sp, val in ((self.shunt, s.shunt_ohm), (self.i_offset, s.current_offset_a * 1000.0),
+                        (self.i_gain, s.current_gain), (self.v_offset, s.voltage_offset_v * 1000.0),
+                        (self.v_gain, s.voltage_gain)):
+            sp.blockSignals(True)
+            sp.setValue(val)
+            sp.blockSignals(False)
+        self._update_shunt_hint()
+
     def _on_calibration_changed(self) -> None:
         s = self.ctrl.settings
         s.shunt_ohm = self.shunt.value()
@@ -357,6 +378,14 @@ class DevicePage(QtWidgets.QWidget):
         s.voltage_gain = self.v_gain.value()
         s.save()
         self.ctrl.apply_calibration()
+        self._update_shunt_hint()
+
+    def _update_shunt_hint(self) -> None:
+        """Warn about an unusual shunt value; the value itself is still accepted."""
+        lo, hi = SHUNT_TYPICAL_OHM
+        unusual = not (lo <= self.shunt.value() <= hi)
+        self.shunt_hint.setText(tr("unusual shunt value, check the resistor") if unusual else "")
+        self.shunt_hint.setVisible(unusual)
 
     def _zero_current(self) -> None:
         data = self.ctrl.data()
@@ -371,8 +400,16 @@ class DevicePage(QtWidgets.QWidget):
             return
         mean_i = float(np.mean(data.i[k:], dtype=np.float64))
         new_offset = self.ctrl.settings.current_offset_a - mean_i
+        lo, hi = self.i_offset.minimum() / 1000.0, self.i_offset.maximum() / 1000.0
+        if not lo <= new_offset <= hi:
+            # Clamping would apply a value other than the one computed: keep the calibration.
+            text = tr("offset out of range, not applied")
+            self._log(text)
+            QtWidgets.QMessageBox.warning(self, tr("Zero now"), text)
+            return
         self.i_offset.setValue(new_offset * 1000.0)
-        self._log(tr("Current zero set: offset {value}", value=format_si(new_offset, "A")))
+        applied = self.i_offset.value() / 1000.0      # what the spin actually holds
+        self._log(tr("Current zero set: offset {value}", value=format_si(applied, "A")))
 
     def _reset_calibration(self) -> None:
         for sp, val in ((self.shunt, 0.010), (self.i_offset, 0.0), (self.i_gain, 1.0),

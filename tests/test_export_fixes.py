@@ -387,7 +387,9 @@ def test_marker_after_close_refuses_replaced_file(tmp_path: Path):
     w = RecordingWriter(tmp_path, CsvFormat())
     w.append(_batch(500))
     assert w.close()
-    w.path.unlink()
+    # Move the original away instead of unlinking it: a freed inode can be reused at once
+    # on some filesystems (CI), which would give the new file the same identity.
+    w.path.rename(tmp_path / "moved.csv")
     w.path.write_text("someone else's file\n")          # regular file, different inode
     w.marker_changed(Marker(1, 1.0, "late"))
     w.flush()

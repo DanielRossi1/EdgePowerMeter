@@ -305,13 +305,16 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc firmware
 arduino-cli upload -p /dev/ttyACM0 --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc firmware
 ```
 
+Build with Arduino-ESP32 core 3.3.x (`arduino-cli core install esp32:esp32@3.3.10`).
+Core 4.0.0 builds sample ~10% slower (median period ~1250-1285 µs vs ~1136 µs).
+
 **How sampling works:**
 - The INA226 runs in continuous shunt+bus mode. The firmware polls its
   conversion-ready flag (the ALERT pin is not wired) and reads the shunt and
   bus registers only when a new conversion is available, so every sample is a
   fresh, non-duplicated conversion with its own µs timestamp.
 - Polling starts at ~85% of the conversion period; the time before that is used
-  for RTC reads and for the OLED, whose 512-byte frames are sent in 16-byte
+  for RTC reads and for the OLED, whose 512-byte frames are sent in 8-byte
   chunks between conversions instead of one ~13 ms blocking transfer.
 - If the host stops reading, data lines are dropped instead of blocking; the
   sequence number keeps counting so the app can report lost samples.

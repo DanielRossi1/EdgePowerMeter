@@ -49,7 +49,7 @@
 // Version
 // =============================================================================
 
-#define FIRMWARE_VERSION "2.0.0"
+#define FIRMWARE_VERSION "2.0.1"
 #define FIRMWARE_NAME "EdgePowerMeter"
 #define PROTOCOL_VERSION 2
 
@@ -119,6 +119,9 @@ namespace Config {
     // cost estimate inflated by one slow transfer), force a little progress
     // anyway, accepting a few skipped conversions.
     constexpr int64_t OLED_FORCE_AFTER_US = 1000000;
+    // Minimum gap between forced OLED steps while starved; bounds how many
+    // conversions a forced step can cost.
+    constexpr int64_t OLED_FORCED_STEP_INTERVAL_US = 2000;
     constexpr uint32_t OLED_MAX_FRAME_SAMPLES = 1000000;
 
     // INA226 configuration read-back (detects a sensor power-on reset)
@@ -226,21 +229,46 @@ namespace Out {
         return putScaled(p, rounded, decimals);
     }
 
+    /**
+     * @brief Set when a reliable write ran out of time waiting for TX room
+     * (the host is not reading). Cleared as soon as the buffer has room again.
+     */
+    bool txStalled = false;
+
     /** @brief Write a data line, or drop it if the TX buffer cannot take it. */
     bool writeData(const char* buf, size_t len) {
         if (Serial.availableForWrite() < static_cast<int>(len)) {
             return false;
         }
         Serial.write(reinterpret_cast<const uint8_t*>(buf), len);
+        txStalled = false;   // a data line going out proves the host is reading
         return true;
     }
 
-    /** @brief Write a line that must not be lost (replies), waiting briefly for room. */
+    /**
+     * @brief Write a line that must not be lost (replies), waiting briefly for room.
+     *
+     * While the host reads, the wait is bounded by RELIABLE_WRITE_TIMEOUT_US.
+     * If the host stops reading, the TX buffer stays full: the line is dropped
+     * and later calls do not wait until room appears again. This keeps a
+     * disconnected or non-reading host from slowing down sampling. A successful
+     * data write (writeData) also clears the stalled flag.
+     */
     void writeReliable(const char* buf, size_t len) {
-        const int64_t deadline = esp_timer_get_time() + Config::RELIABLE_WRITE_TIMEOUT_US;
-        while (Serial.availableForWrite() < static_cast<int>(len) && esp_timer_get_time() < deadline) {
-            delayMicroseconds(200);
+        const int n = static_cast<int>(len);
+        if (Serial.availableForWrite() < n) {
+            if (!txStalled) {
+                const int64_t deadline = esp_timer_get_time() + Config::RELIABLE_WRITE_TIMEOUT_US;
+                while (Serial.availableForWrite() < n && esp_timer_get_time() < deadline) {
+                    delayMicroseconds(200);
+                }
+            }
+            if (Serial.availableForWrite() < n) {
+                txStalled = true;   // no room: drop the line instead of blocking
+                return;
+            }
         }
+        txStalled = false;
         Serial.write(reinterpret_cast<const uint8_t*>(buf), len);
     }
 
@@ -500,7 +528,18 @@ namespace Sampling {
 // =============================================================================
 
 namespace Anchors {
-    void emit() {
+    /**
+     * @brief Write the "T,<t_us>,<rtc_s>,<src>" time anchor line.
+     *
+     * @param reliable false (default): written as a data line via writeData and
+     *        silently dropped if the TX buffer has no room. Used by the periodic
+     *        call so it never blocks sampling.
+     *        true: written via writeReliable, which waits briefly for TX room.
+     *        Used right after a "MODE RAW" reply, after a clock sync, and when the
+     *        stream resumes, so the host reliably gets a wall-clock reference at
+     *        the start of a raw recording.
+     */
+    void emit(bool reliable = false) {
         if (!precisionTime.hasAnchor()) return;
         char buf[64];
         char* p = buf;
@@ -512,7 +551,12 @@ namespace Anchors {
         *p++ = ',';
         *p++ = precisionTime.anchorSource() == PrecisionTime::Source::Sqw ? 'S' : 'P';
         *p++ = '\n';
-        Out::writeData(buf, static_cast<size_t>(p - buf));
+        const size_t len = static_cast<size_t>(p - buf);
+        if (reliable) {
+            Out::writeReliable(buf, len);
+        } else {
+            Out::writeData(buf, len);
+        }
     }
 }
 
@@ -524,6 +568,8 @@ namespace Display {
     int64_t nextFrameUs = 0;
     int64_t frameStartUs = 0;
     int64_t lastProgressUs = 0;
+    int64_t lastForcedUs = 0;
+    bool starved = false;   // no step ran for OLED_FORCE_AFTER_US; see service()
     float lastV = 0.0f;
     float lastI = 0.0f;
     float lastP = 0.0f;
@@ -576,7 +622,11 @@ namespace Display {
      * step taking ~100-300 µs, so steps fit in the idle time after a sample
      * and sampling never misses a conversion because of the display. If no
      * step could run for OLED_FORCE_AFTER_US (no idle time at all, e.g.
-     * AVG 1), one step is forced per loop so the display still updates.
+     * AVG 1), the display is "starved": one step is forced per call to
+     * service(), at most once every OLED_FORCED_STEP_INTERVAL_US, until the
+     * current frame (render and transfer) completes. Forced steps are spaced
+     * so that they cost a bounded number of conversions. Starved mode ends
+     * when the frame is complete.
      */
     void service(int64_t now) {
         // Keep the frame accumulators bounded while nothing is rendered
@@ -585,6 +635,7 @@ namespace Display {
         }
         if (!display.isPresent() || !display.isEnabled()) {
             lastProgressUs = now;
+            starved = false;
             return;
         }
 
@@ -593,12 +644,16 @@ namespace Display {
             nextFrameUs = now + Config::OLED_FRAME_INTERVAL_US;
         }
 
-        bool forced = now - lastProgressUs > Config::OLED_FORCE_AFTER_US;
+        if (!starved && now - lastProgressUs > Config::OLED_FORCE_AFTER_US) {
+            starved = true;
+        }
+        bool forced = starved && now - lastForcedUs >= Config::OLED_FORCED_STEP_INTERVAL_US;
         while (display.renderActive() || display.transferActive()) {
             const int64_t t = esp_timer_get_time();
             const uint32_t cost = display.renderActive() ? display.glyphCostUs()
                                                          : display.chunkCostUs();
             if (Sampling::slackUs(t) < static_cast<int64_t>(cost) && !forced) break;
+            if (forced) lastForcedUs = t;
             forced = false;
             bool ok = true;
             if (display.renderActive()) {
@@ -611,6 +666,7 @@ namespace Display {
         }
         if (!display.renderActive() && !display.transferActive()) {
             lastProgressUs = esp_timer_get_time();
+            starved = false;
         }
     }
 }
@@ -712,7 +768,7 @@ namespace Commands {
             streamEnabled = b;
             replyOk("SET");
             if (b && outputMode == OutputMode::Raw) {
-                Anchors::emit();  // The host may hold a stale anchor after a pause
+                Anchors::emit(true);  // The host may hold a stale anchor after a pause
             }
         } else {
             replyErr("SET", "unknown_parameter");
@@ -748,7 +804,7 @@ namespace Commands {
         }
         replyOk("SYNC");
         if (outputMode == OutputMode::Raw && streamEnabled) {
-            Anchors::emit();  // New time line starts now
+            Anchors::emit(true);  // New time line starts now
         }
     }
 
@@ -756,7 +812,7 @@ namespace Commands {
         if (arg && strcmp(arg, "RAW") == 0) {
             outputMode = OutputMode::Raw;
             replyOk("MODE");
-            Anchors::emit();  // Give the host a wall-clock reference right away
+            Anchors::emit(true);  // Give the host a wall-clock reference right away
         } else if (arg && strcmp(arg, "CSV") == 0) {
             outputMode = OutputMode::Csv;
             replyOk("MODE");
@@ -767,6 +823,17 @@ namespace Commands {
     }
 
     void execute(char* line) {
+        // On Linux the host tty can echo the device's own output back for a
+        // moment after the port is opened (before the host disables ECHO).
+        // Those echoed lines ("# EdgePowerMeter ...", "D,...", "T,...",
+        // "!HELLO,...", "TIMESTAMP,...") must not get an error reply, so they
+        // are dropped silently. Real commands always start with a letter and
+        // contain no ',' in their first token.
+        const char* first = line;
+        while (*first == ' ' || *first == '\t') first++;
+        const char lead = *first;
+        if (!((lead >= 'A' && lead <= 'Z') || (lead >= 'a' && lead <= 'z'))) return;
+
         for (char* c = line; *c; c++) {
             *c = static_cast<char>(toupper(static_cast<unsigned char>(*c)));
         }
@@ -774,6 +841,7 @@ namespace Commands {
         char* save = nullptr;
         char* cmd = strtok_r(line, " \t", &save);
         if (!cmd) return;  // Empty line
+        if (strchr(cmd, ',')) return;  // Echoed CSV/telemetry line (e.g. "TIMESTAMP,...", "D,...")
         char* arg1 = strtok_r(nullptr, " \t", &save);
         char* arg2 = strtok_r(nullptr, " \t", &save);
 

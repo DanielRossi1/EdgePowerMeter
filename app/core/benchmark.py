@@ -36,16 +36,19 @@ class BenchmarkResult:
     net_power_w: Optional[float] = None
     net_energy_per_unit_j: Optional[float] = None
     net_rate_per_watt: Optional[float] = None
+    connected_s: float = 0.0       # time with data (excludes disconnection gaps)
 
 
 def compute(stats: Optional[Statistics], inp: BenchmarkInput) -> Optional[BenchmarkResult]:
     """None when the range or the inputs are not usable."""
     if stats is None or stats.duration_seconds <= 0:
         return None
-    t = stats.duration_seconds
+    # Energy only covers the connected time: power and rates use the same
+    # time base, otherwise a disconnection gap dilutes the average power.
+    t = stats.connected_seconds
+    if t <= 0:
+        return None
     energy = stats.energy_wh * 3600.0
-    # Average power from the integrated energy, consistent with the energy
-    # figures even with uneven sample spacing or gaps.
     power = energy / t
     if inp.units is not None and inp.units > 0:
         units = float(inp.units)
@@ -58,7 +61,7 @@ def compute(stats: Optional[Statistics], inp: BenchmarkInput) -> Optional[Benchm
     if power <= 0:
         return None
     res = BenchmarkResult(
-        duration_s=t,
+        duration_s=stats.duration_seconds,
         avg_power_w=power,
         energy_j=energy,
         units=units,
@@ -66,6 +69,7 @@ def compute(stats: Optional[Statistics], inp: BenchmarkInput) -> Optional[Benchm
         energy_per_unit_j=energy / units,
         units_per_joule=units / energy if energy > 0 else 0.0,
         rate_per_watt=rate / power,
+        connected_s=t,
     )
     if inp.idle_power_w is not None and inp.idle_power_w >= 0:
         net = power - inp.idle_power_w

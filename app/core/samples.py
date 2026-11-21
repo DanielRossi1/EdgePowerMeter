@@ -40,13 +40,28 @@ class Samples:
 
     @classmethod
     def from_columns(cls, t, wall, v, i, p) -> "Samples":
-        return cls(
-            np.asarray(t, dtype=np.float64),
-            np.asarray(wall, dtype=np.float64),
-            np.asarray(v, dtype=np.float32),
-            np.asarray(i, dtype=np.float32),
-            np.asarray(p, dtype=np.float32),
-        )
+        """Build from parallel arrays.
+
+        A row in which a finite value overflows the float32 range (1e308 casts to
+        inf) is dropped, so the columns stay aligned; such a value would poison
+        every statistic. NaN and inf input is kept as given, as before.
+        """
+        v64 = np.asarray(v, dtype=np.float64)
+        i64 = np.asarray(i, dtype=np.float64)
+        p64 = np.asarray(p, dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):   # the overflow is the point
+            v32 = v64.astype(np.float32)
+            i32 = i64.astype(np.float32)
+            p32 = p64.astype(np.float32)
+        overflow = (np.isinf(v32) & np.isfinite(v64))
+        overflow |= np.isinf(i32) & np.isfinite(i64)
+        overflow |= np.isinf(p32) & np.isfinite(p64)
+        t64 = np.asarray(t, dtype=np.float64)
+        wall64 = np.asarray(wall, dtype=np.float64)
+        if overflow.any():
+            keep = ~overflow
+            t64, wall64, v32, i32, p32 = (a[keep] for a in (t64, wall64, v32, i32, p32))
+        return cls(t64, wall64, v32, i32, p32)
 
     def __len__(self) -> int:
         return int(self.t.shape[0])

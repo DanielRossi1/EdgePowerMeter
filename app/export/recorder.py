@@ -11,6 +11,7 @@ file never has to be rewritten. No hidden or temporary files are created.
 from __future__ import annotations
 
 import os
+import stat
 import time
 from datetime import datetime
 from pathlib import Path
@@ -83,13 +84,23 @@ def default_folder() -> Path:
     return base / "EdgePowerMeter"
 
 
-def unique_path(folder: Path, stem: str, suffix: str = ".csv") -> Path:
-    path = folder / f"{stem}{suffix}"
-    k = 2
-    while path.exists():
-        path = folder / f"{stem}_{k}{suffix}"
-        k += 1
-    return path
+def create_unique_file(folder: Path, stem: str, suffix: str = ".csv"):
+    """Create a new file (never overwriting one) -> (path, open file).
+
+    Creating with mode "x" makes the check and the creation atomic, so two
+    instances starting in the same second get different names."""
+    k = 1
+    while True:
+        name = f"{stem}{suffix}" if k == 1 else f"{stem}_{k}{suffix}"
+        path = folder / name
+        try:
+            return path, open(path, "x", newline="", encoding="utf-8")
+        except FileExistsError:
+            k += 1
+
+
+def _identity(st: os.stat_result):
+    return (st.st_dev, st.st_ino)
 
 
 class RecordingWriter:
@@ -97,13 +108,15 @@ class RecordingWriter:
         folder = Path(folder)
         folder.mkdir(parents=True, exist_ok=True)
         stamp = (started or datetime.now()).strftime("%Y%m%d_%H%M%S")
-        self.path = unique_path(folder, f"recording_{stamp}")
+        self.path, self._f = create_unique_file(folder, f"recording_{stamp}")
         self.fmt = fmt
         self._pending: List[Samples] = []
         self._pending_lines: List[str] = []
-        self._f = open(self.path, "w", newline="", encoding="utf-8")
         self._f.write(fmt.header())
         self._f.flush()
+        # Identity of the file we created: a closed recording is reopened for
+        # late marker edits only if the path still names this very file.
+        self._ident = _identity(os.fstat(self._f.fileno()))
         self._last_fsync = time.monotonic()
         self.samples_written = 0
         self.first_t: Optional[float] = None
@@ -123,16 +136,42 @@ class RecordingWriter:
         self.has_markers = True
         self._pending_lines.append(MarkerList.line(m))
 
+    def _open_for_append(self):
+        """Reopen a closed recording for appending, but only if the path is
+        still the regular file this writer created (not a symlink or a replacement)."""
+        lst = os.lstat(self.path)          # does not follow a symlink
+        if not stat.S_ISREG(lst.st_mode) or _identity(lst) != self._ident:
+            raise OSError(f"recording file was replaced; not writing to it: {self.path}")
+        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.path, flags)
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode) or _identity(fst) != self._ident:
+                raise OSError(f"recording file was replaced; not writing to it: {self.path}")
+            return os.fdopen(fd, "a", newline="", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+
     def marker_deleted(self, marker_id: int) -> None:
         self._pending_lines.append(MarkerList.delete_line(marker_id))
 
+    def _removed(self) -> bool:
+        """True if the file was deleted: writes would go to an orphaned inode
+        (open file) or silently recreate a file without its header (closed)."""
+        if not self.path.exists():
+            return True
+        return self._f is not None and os.fstat(self._f.fileno()).st_nlink == 0
+
     def flush(self) -> None:
         """Write buffered samples and marker events. Errors (disk full,
-        folder removed) are recorded in `error` instead of being raised."""
+        folder removed, file deleted) are recorded in `error` instead of being raised."""
         if not (self._pending or self._pending_lines) or self.error:
             return
         try:
-            f = self._f if self._f is not None else open(self.path, "a", newline="", encoding="utf-8")
+            if self._removed():
+                raise OSError(f"recording file was deleted while recording: {self.path}")
+            f = self._f if self._f is not None else self._open_for_append()
             for b in self._pending:
                 f.writelines(self.fmt.rows(b))
                 self.samples_written += len(b)
@@ -147,7 +186,7 @@ class RecordingWriter:
             elif time.monotonic() - self._last_fsync > FSYNC_INTERVAL_S:
                 os.fsync(f.fileno())
                 self._last_fsync = time.monotonic()
-        except OSError as e:
+        except (OSError, ValueError) as e:      # UnicodeError is a ValueError
             self.error = str(e)
         finally:
             self._pending.clear()

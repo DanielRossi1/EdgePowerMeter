@@ -32,6 +32,9 @@ class Statistics:
     power_std: float
     energy_wh: float
     charge_ah: float
+    # Time actually covered by integrated intervals (wall duration minus the
+    # skipped disconnection gaps). Equals duration_seconds when there are no gaps.
+    connected_seconds: float = 0.0
 
     @classmethod
     def from_samples(cls, s: Samples) -> Optional["Statistics"]:
@@ -52,9 +55,11 @@ class Statistics:
             # and charge are reported as 0 instead of being invented from an
             # assumed sample rate.
             duration = 0.0
-            energy_ws = charge_as = 0.0
+            energy_ws = charge_as = connected = 0.0
         else:
-            energy_ws, charge_as = integrate_energy(dt, p, i, gap_threshold(dt))
+            max_gap = gap_threshold(dt)
+            energy_ws, charge_as = integrate_energy(dt, p, i, max_gap)
+            connected = connected_time(dt, max_gap)
 
         return cls(
             count=n,
@@ -75,6 +80,7 @@ class Statistics:
             power_std=float(p.std(ddof=1)),
             energy_wh=energy_ws / 3600.0,
             charge_ah=charge_as / 3600.0,
+            connected_seconds=connected,
         )
 
 
@@ -100,6 +106,14 @@ def integrate_energy(dt: np.ndarray, p: np.ndarray, i: np.ndarray,
         dt = np.where(dt > max_gap, 0.0, dt)
     dt = np.maximum(dt, 0.0)
     return float(np.dot(p_mid, dt)), float(np.dot(i_mid, dt))
+
+
+def connected_time(dt: np.ndarray, max_gap: Optional[float] = None) -> float:
+    """Sum of the sample intervals that integrate_energy does not skip."""
+    dt = np.maximum(dt, 0.0)
+    if max_gap is not None:
+        dt = np.where(dt > max_gap, 0.0, dt)
+    return float(dt.sum())
 
 
 class RunningStats:
@@ -134,9 +148,12 @@ class RunningStats:
             p_all, i_all = p, i
         if len(t) >= 2:
             dt = np.diff(t)
-            if len(dt) >= 8 or self._gap is None:
+            # Only a batch with enough intervals may (re)define the persisted
+            # threshold; smaller batches use a per-call threshold.
+            if len(dt) >= 8:
                 self._gap = gap_threshold(dt)
-            e, q = integrate_energy(dt, p_all, i_all, self._gap)
+            gap = self._gap if self._gap is not None else gap_threshold(dt)
+            e, q = integrate_energy(dt, p_all, i_all, gap)
             self.energy_ws += e
             self.charge_as += q
         self._last = (float(b.t[-1]), float(i[-1]), float(p[-1]))

@@ -1,6 +1,8 @@
 """SampleStore, Statistics, RunningStats, power supply quality, spectrum."""
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -75,9 +77,22 @@ def test_running_stats_matches_batch_statistics():
     assert rs.count == 5000
 
 
-def test_psu_zero_volt_rail_no_nan():
+def test_psu_zero_volt_rail_not_rated_good():
     q = PowerSupplyAnalyzer().analyze_voltage_quality(_samples(100, v=0.0))
-    assert q.voltage_ripple_percent == 0.0
+    assert math.isnan(q.voltage_ripple_percent)
+    assert q.stability_rating == "poor"
+    assert not (q.meets_1percent_spec or q.meets_01percent_spec or q.meets_005percent_spec)
+    assert q.load_regulation_percent is None
+
+
+def test_psu_unsettled_step_reports_no_settling_time():
+    n = 1000
+    i = np.where(np.arange(n) < 500, 0.1, 0.6)
+    v = np.where(np.arange(n) < 500, 5.0, 4.95)
+    v[500 + 499] = 4.0      # last sample of the 0.5 s settling window still off
+    s = Samples.from_columns(np.arange(n) / 1000.0, np.zeros(n), v, i, v * i)
+    q = PowerSupplyAnalyzer().analyze_voltage_quality(s)
+    assert q.settling_time_ms is None
 
 
 def test_psu_stable_supply_excellent():
@@ -111,3 +126,18 @@ def test_spectrum_finds_sine_frequency_and_amplitude():
 
 def test_spectrum_requires_variation():
     assert analyze_spectrum(_samples(1000), "current") is None
+
+
+def test_spectrum_capped_grid_does_not_alias():
+    # 300 Hz tone sampled at 1 kHz, analysed on a grid capped to ~500 Hz
+    # (Nyquist 250 Hz). Naive decimation folds it to 200 Hz.
+    n, rate = 20000, 1000.0
+    t = np.arange(n) / rate
+    i = 0.5 + 0.1 * np.sin(2 * np.pi * 50 * t) + 0.1 * np.sin(2 * np.pi * 300 * t)
+    s = Samples.from_columns(t, t, np.ones(n), i, i)
+    res = analyze_spectrum(s, "current", max_points=10000)
+    assert res.sample_rate == pytest.approx(500.0, rel=1e-3)
+    assert res.nyquist_hz == pytest.approx(250.0, rel=1e-3)
+    assert res.dominant.frequency == pytest.approx(50, abs=0.5)
+    alias = int(np.argmin(np.abs(res.frequencies - 200.0)))
+    assert res.amplitudes[alias] < 0.01 * res.amplitudes[int(np.argmin(np.abs(res.frequencies - 50)))]

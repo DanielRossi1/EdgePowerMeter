@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 from .samples import Samples
 from .statistics import Statistics
@@ -12,6 +16,17 @@ from .statistics import Statistics
 # friendly: a later line with the same id replaces the earlier one, and a
 # DELETE line removes it, so an autosaved recording never has to be rewritten.
 MARKER_PREFIX = "#MARKER"
+
+# Labels starting with these characters are written with a leading apostrophe
+# so a spreadsheet does not evaluate them as formulas (CSV injection). An
+# apostrophe itself is escaped too, which keeps the round trip exact.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "'")
+LABEL_MAX_CHARS = 60
+# A tab or line break inside a label would split the '#MARKER' line into wrong fields.
+_LINE_BREAKS = re.compile("[\t\r\n]")
+
+# Lone UTF-16 surrogates cannot be encoded as UTF-8 (and reportlab / files choke on them).
+_SURROGATES = re.compile("[\ud800-\udfff]")
 
 
 @dataclass
@@ -29,8 +44,14 @@ class Segment:
     stats: Optional[Statistics]
 
 
+def strip_surrogates(text: str) -> str:
+    """Replace lone surrogates (not valid text) with U+FFFD."""
+    return _SURROGATES.sub("\ufffd", text)
+
+
 def clean_label(label: str) -> str:
-    return " ".join(str(label).replace("\t", " ").split())[:60]
+    text = strip_surrogates(str(label))
+    return " ".join(text.replace("\t", " ").split())[:LABEL_MAX_CHARS]
 
 
 class MarkerList:
@@ -104,19 +125,36 @@ class MarkerList:
 
     def segments(self, data: Samples, start_label: str = "Start",
                  end_label: str = "End") -> List[Segment]:
-        """Segments between consecutive markers (and the recording ends)."""
+        """Segments between consecutive markers (and the recording ends).
+
+        Consecutive segments share their boundary sample. The segment energies
+        add up to the energy of the whole range, but an interval that straddles
+        a marker is assigned entirely to the earlier segment. A segment shorter
+        than one sample interval can therefore contain no samples and has
+        ``stats=None``.
+        """
         b = self.boundaries(data)
+        if len(b) < 2:
+            return []
+        # Index of the boundary sample: first sample at or after each marker.
+        idx = [0]
+        idx += [int(np.searchsorted(data.t, t, side="left")) for t, _ in b[1:-1]]
+        idx.append(len(data) - 1)
         out: List[Segment] = []
-        for (a, la), (z, lz) in zip(b, b[1:]):
+        for k, ((a, la), (z, lz)) in enumerate(zip(b, b[1:])):
             name = f"{la or start_label} → {lz or end_label}"
-            out.append(Segment(a, z, name, Statistics.from_samples(data.between(a, z))))
+            stats = Statistics.from_samples(data.slice(idx[k], idx[k + 1] + 1))
+            out.append(Segment(a, z, name, stats))
         return out
 
     # --------------------------------------------------------- persistence
 
     @staticmethod
     def line(m: Marker) -> str:
-        return f"{MARKER_PREFIX}\t{m.id}\t{m.t:.6f}\t{m.label}"
+        label = _LINE_BREAKS.sub(" ", strip_surrogates(str(m.label)))
+        if label.lstrip().startswith(_FORMULA_PREFIXES):
+            label = "'" + label
+        return f"{MARKER_PREFIX}\t{m.id}\t{m.t:.6f}\t{label}"
 
     @staticmethod
     def delete_line(marker_id: int) -> str:
@@ -135,7 +173,13 @@ class MarkerList:
             if len(parts) >= 3 and parts[2] == "DELETE":
                 self.remove(mid)
             else:
-                self.put(mid, float(parts[2]), parts[3] if len(parts) > 3 else "")
+                t = float(parts[2])
+                if not math.isfinite(t):
+                    return False
+                label = parts[3] if len(parts) > 3 else ""
+                if label.startswith("'"):          # undo the formula escape of line()
+                    label = label[1:]
+                self.put(mid, t, label)
         except (IndexError, ValueError):
             return False
         return True

@@ -8,6 +8,7 @@ switching-regulator ripple aliasing, thermal throttling cycles, etc.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -34,6 +35,7 @@ class SpectrumResult:
     frequencies: np.ndarray
     amplitudes: np.ndarray         # single-sided amplitude spectrum
     peaks: List[SpectrumPeak] = field(default_factory=list)
+    nyquist_hz: float = 0.0        # highest frequency represented (grid Nyquist)
 
     @property
     def dominant(self) -> Optional[SpectrumPeak]:
@@ -57,12 +59,21 @@ def analyze_spectrum(s: Samples, signal: str = "current",
     y = s.column(signal).astype(np.float64)
     t = s.t
 
-    n = min(len(t), max_points)
-    grid = np.linspace(t[0], t[-1], n)
-    dt = float(grid[1] - grid[0])
+    if len(t) <= max_points:
+        grid = np.linspace(t[0], t[-1], len(t))
+        y = np.interp(grid, t, y)
+    else:
+        # Capping the grid must not alias: low-pass the native-rate signal to
+        # the decimated Nyquist before keeping every k-th point.
+        decim = math.ceil(len(t) / max_points)
+        native = np.linspace(t[0], t[-1], len(t))
+        y = _anti_alias(np.interp(native, t, y), decim)
+        grid = native[::decim]
+        y = y[::decim]
+    n = len(grid)
+    dt = float(grid[1] - grid[0]) if n > 1 else 0.0
     if dt <= 0:
         return None
-    y = np.interp(grid, t, y)
 
     mean = float(y.mean())
     ac = y - mean
@@ -93,4 +104,31 @@ def analyze_spectrum(s: Samples, signal: str = "current",
         frequencies=freqs,
         amplitudes=spec,
         peaks=peaks,
+        nyquist_hz=0.5 / dt,
     )
+
+
+def _anti_alias(y: np.ndarray, decim: int) -> np.ndarray:
+    """Windowed-sinc low-pass at 80 % of the decimated Nyquist frequency.
+
+    Applied by block FFT convolution (overlap-add), so neither the cost nor
+    the memory grows with the decimation factor or with the recording length
+    beyond the output itself. Zero-phase ('same' alignment), unity DC gain.
+    """
+    half = min(16 * decim, (len(y) - 1) // 2)
+    if half < 1:
+        return y
+    m = np.arange(-half, half + 1)
+    fc = 0.4 / decim                       # cycles per native sample
+    h = 2.0 * fc * np.sinc(2.0 * fc * m) * np.hanning(2 * half + 1)
+    h /= h.sum()
+    nh = len(h)
+    block = max(1 << 18, 8 * nh)
+    nfft = 1 << (block + nh - 2).bit_length()
+    hf = np.fft.rfft(h, nfft)
+    out = np.zeros(len(y) + nh - 1)
+    for start in range(0, len(y), block):
+        seg = y[start:start + block]
+        k = len(seg) + nh - 1
+        out[start:start + k] += np.fft.irfft(np.fft.rfft(seg, nfft) * hf, nfft)[:k]
+    return out[half:half + len(y)]

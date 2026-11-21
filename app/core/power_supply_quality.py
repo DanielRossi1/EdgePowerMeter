@@ -58,6 +58,7 @@ class PowerSupplyAnalyzer:
     FAIR_THRESHOLD = 1.0
 
     MIN_SAMPLES = 10
+    MIN_NOMINAL_V = 1e-3        # below this there is no meaningful relative figure
     SETTLING_WINDOW_S = 0.5     # how long after a step we look for settling
 
     def analyze_voltage_quality(self, s: Samples,
@@ -73,17 +74,15 @@ class PowerSupplyAnalyzer:
         nominal = v_mean if nominal_voltage is None else float(nominal_voltage)
 
         ripple_v = v_max - v_min
-        # A ~0 V rail (no source connected) has no meaningful relative ripple.
-        ripple_pct = 0.0 if abs(nominal) < 1e-9 else ripple_v / abs(nominal) * 100.0
-
-        if ripple_pct < self.EXCELLENT_THRESHOLD:
-            rating = RATING_EXCELLENT
-        elif ripple_pct < self.GOOD_THRESHOLD:
-            rating = RATING_GOOD
-        elif ripple_pct < self.FAIR_THRESHOLD:
-            rating = RATING_FAIR
-        else:
+        no_reference = abs(nominal) < self.MIN_NOMINAL_V
+        if no_reference:
+            # A ~0 V rail (no source connected) has no meaningful relative
+            # ripple: report NaN and never rate it as good.
+            ripple_pct = float("nan")
             rating = RATING_POOR
+        else:
+            ripple_pct = ripple_v / abs(nominal) * 100.0
+            rating = self._rate(ripple_pct)
 
         load_reg, settling = self._analyze_load_step(s, v, nominal)
 
@@ -98,10 +97,19 @@ class PowerSupplyAnalyzer:
             rms_noise=float(np.sqrt(np.mean((v - v_mean) ** 2))),
             std_deviation=v_std,
             stability_rating=rating,
-            meets_1percent_spec=ripple_pct < 1.0,
-            meets_01percent_spec=ripple_pct < 0.1,
-            meets_005percent_spec=ripple_pct < 0.05,
+            meets_1percent_spec=not no_reference and ripple_pct < 1.0,
+            meets_01percent_spec=not no_reference and ripple_pct < 0.1,
+            meets_005percent_spec=not no_reference and ripple_pct < 0.05,
         )
+
+    def _rate(self, ripple_pct: float) -> str:
+        if ripple_pct < self.EXCELLENT_THRESHOLD:
+            return RATING_EXCELLENT
+        if ripple_pct < self.GOOD_THRESHOLD:
+            return RATING_GOOD
+        if ripple_pct < self.FAIR_THRESHOLD:
+            return RATING_FAIR
+        return RATING_POOR
 
     def _analyze_load_step(self, s: Samples, v: np.ndarray, nominal: float
                            ) -> Tuple[Optional[float], Optional[float]]:
@@ -143,11 +151,18 @@ class PowerSupplyAnalyzer:
         band = max(3.0 * float(tail.std()), 0.001 * abs(nominal), 1.25e-3)
 
         outside = np.flatnonzero(np.abs(post - v_after) > band)
-        settle_idx = k + (int(outside[-1]) + 1 if len(outside) else 0)
-        settle_idx = min(settle_idx, len(t) - 1)
+        if len(outside) and int(outside[-1]) == len(post) - 1:
+            # Still outside the band at the end of the window: not settled.
+            settle_ms = None
+        else:
+            settle_idx = k + (int(outside[-1]) + 1 if len(outside) else 0)
+            settle_ms = float(t[min(settle_idx, len(t) - 1)] - t_step) * 1000.0
 
-        load_reg = 0.0 if abs(nominal) < 1e-9 else abs(v_after - v_before) / abs(nominal) * 100.0
-        return load_reg, float(t[settle_idx] - t_step) * 1000.0
+        if abs(nominal) < self.MIN_NOMINAL_V:
+            load_reg = None         # relative figure is meaningless without a reference
+        else:
+            load_reg = abs(v_after - v_before) / abs(nominal) * 100.0
+        return load_reg, settle_ms
 
     @staticmethod
     def get_quality_recommendations(q: PowerSupplyQuality) -> List[str]:

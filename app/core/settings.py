@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass, fields
 from typing import Any, Dict
 
@@ -9,6 +11,11 @@ from PySide6.QtCore import QSettings
 
 _ORG, _APP = "EdgePowerMeter", "EdgePowerMeter"
 _GROUP = "settings_v2"
+
+# Serial rates the app accepts (the settings page offers the serial-config subset).
+BAUD_RATES = (9600, 115200, 230400, 460800, 921600, 1000000, 2000000)
+BAUD_FALLBACK = 115200
+OFFSET_LIMIT = 100.0          # calibration offsets, in V or A: |offset| <= this
 
 # Allowed values for enumerated settings (first entry is the fallback).
 CHOICES: Dict[str, tuple] = {
@@ -84,11 +91,22 @@ class AppSettings:
     report_notes: str = ""
     last_dir: str = ""
 
+    # Automation API (see docs/API.md); the token is generated on first run.
+    api_enabled: bool = False
+    api_port: int = 8765
+    api_token: str = ""
+
     def validate(self) -> None:
         """Clamp numeric values and reset invalid enumerations."""
         for name, allowed in CHOICES.items():
             if getattr(self, name) not in allowed:
                 setattr(self, name, allowed[0])
+        # NaN/inf compare false against every bound, so they would pass the
+        # clamps below unchanged: reset them to the factory default first.
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, float) and not math.isfinite(value):
+                setattr(self, f.name, f.default)
         self.plot_fps = min(max(self.plot_fps, 5), 120)
         self.time_window_s = min(max(self.time_window_s, 0.5), 3600.0)
         self.line_width = min(max(self.line_width, 0.5), 5.0)
@@ -103,6 +121,18 @@ class AppSettings:
             self.voltage_gain = 1.0
         if not (0.5 <= self.current_gain <= 2.0):
             self.current_gain = 1.0
+        self.api_port = min(max(self.api_port, 1024), 65535)
+        if not isinstance(self.api_token, str):
+            self.api_token = ""
+        # A NUL byte cannot be part of a path (open/stat raise ValueError): use the default.
+        if not isinstance(self.recordings_dir, str) or "\x00" in self.recordings_dir:
+            self.recordings_dir = ""
+        if self.baud_rate not in BAUD_RATES:
+            self.baud_rate = BAUD_FALLBACK
+        if not (-OFFSET_LIMIT <= self.voltage_offset_v <= OFFSET_LIMIT):
+            self.voltage_offset_v = 0.0
+        if not (-OFFSET_LIMIT <= self.current_offset_a <= OFFSET_LIMIT):
+            self.current_offset_a = 0.0
 
     def copy(self) -> "AppSettings":
         return AppSettings(**{f.name: getattr(self, f.name) for f in fields(self)})
@@ -118,6 +148,7 @@ class AppSettings:
                 s.setValue(name, value)
             s.endGroup()
             s.sync()
+            _restrict_permissions(s.fileName())
         except Exception:
             pass
 
@@ -135,12 +166,21 @@ class AppSettings:
                 if f.name in stored and stored[f.name] is not None:
                     try:
                         setattr(inst, f.name, _coerce(stored[f.name], getattr(inst, f.name)))
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         pass
         except Exception:
             pass
         inst.validate()
         return inst
+
+
+def _restrict_permissions(path: str) -> None:
+    """The settings file holds the API token: owner read/write only.
+    chmod has no effect on some platforms (Windows registry or ACLs); ignore that."""
+    try:
+        os.chmod(path, 0o600)
+    except (OSError, ValueError, TypeError):
+        pass
 
 
 def _coerce(value: Any, default: Any) -> Any:
@@ -149,10 +189,11 @@ def _coerce(value: Any, default: Any) -> Any:
         if isinstance(value, str):
             return value.strip().lower() in ("true", "1", "yes")
         return bool(value)
-    if isinstance(default, int):
-        return int(float(value))
-    if isinstance(default, float):
-        return float(value)
+    if isinstance(default, (int, float)):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"non-finite number: {value!r}")
+        return int(number) if isinstance(default, int) else number
     return str(value)
 
 

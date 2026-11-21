@@ -184,7 +184,7 @@ jobs:
           path: dist/EdgePowerMeter-intel.dmg
 
   build-macos-arm:
-    runs-on: macos-14  # Apple Silicon (M1/M2)
+    runs-on: macos-15  # Apple Silicon, macOS 15
     steps:
       - name: Free disk space
         run: |

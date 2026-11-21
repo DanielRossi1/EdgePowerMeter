@@ -59,6 +59,7 @@ Documentation = "https://github.com/DanielRossi1/EdgePowerMeter/tree/main/docs"
 
 [project.scripts]
 edgepowermeter = "app.main:main"
+edgepowermeter-mcp = "app.api.mcp_bridge:main"
 
 [project.gui-scripts]
 edgepowermeter-gui = "app.main:main"
